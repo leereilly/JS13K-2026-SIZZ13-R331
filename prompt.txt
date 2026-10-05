@@ -1,0 +1,135 @@
+I have 13 short gameplay video clips that I want to combine into a polished highlight reel using **FFmpeg**.
+
+Videos are videos folder.
+
+### Input
+
+There are 13 video clips in a directory. Each clip corresponds to one game.
+
+I also have a CSV containing metadata for each clip with columns similar to:
+
+```csv
+place,game,github_username
+1,Game Name,username
+2,Another Game,anotheruser
+3,Third Game,thirduser
+...
+```
+
+CSV file is called `data.csv`.
+
+The CSV order should determine the order of the clips in the final video.
+
+The clips are approximately 13 seconds each, but don't assume they are identical in resolution, frame rate, codec, or audio format.
+
+### Goal
+
+Create one polished video montage from all 13 clips.
+
+The result should feel like a **GitHub Game Off / indie game showcase reel** rather than simply concatenating the videos.
+
+### Visual design
+
+For each clip:
+
+* Show the gameplay full-screen.
+* Add a tasteful **lower-third overlay** near the bottom of the screen.
+* The lower third should contain:
+
+  * The game's title prominently.
+  * The creator's GitHub username, prefixed with `@`.
+  * The creator's placement, such as `1st`, `2nd`, `3rd`, etc., where appropriate.
+* Include a small **GitHub Octocat** icon/logo as part of the lower-third design.
+* The lower third should be visually clean and modern, with good contrast against arbitrary gameplay footage.
+* Add a subtle translucent background/gradient behind the text if necessary for readability.
+* Keep the overlay away from important gameplay UI where possible.
+* Don't make the lower third too large or distracting.
+
+### Transitions
+
+Use attractive, professional transitions between clips rather than hard cuts.
+
+Prefer something subtle and energetic, such as:
+
+* short crossfades
+* subtle zoom/push transitions
+* directional wipes
+* or another transition that can be implemented reliably with FFmpeg
+
+Keep transitions relatively short, around 0.5–1 second. The gameplay should remain the focus.
+
+Don't use cheesy PowerPoint-style transitions.
+
+### Timing
+
+Each clip should play in its entirety unless there is a technical reason not to.
+
+The transition should overlap the end of one clip and beginning of the next so the final video doesn't become unnecessarily long.
+
+### Technical requirements
+
+Build this as a reproducible script, preferably:
+
+```bash
+./make-montage.sh clips/ games.csv output.mp4
+```
+
+or an equivalent Python script that invokes FFmpeg.
+
+The script should:
+
+1. Read the CSV.
+2. Match each CSV row to the appropriate video clip.
+3. Sort clips according to placement/order in the CSV.
+4. Normalize video dimensions, frame rate, pixel format, and audio format as necessary.
+5. Add the lower-third graphics and Octocat to each clip.
+6. Apply transitions between clips.
+7. Encode a final MP4 suitable for sharing on the web.
+8. Handle clips with different resolutions, frame rates, orientations, or missing audio gracefully.
+9. Clean up temporary files when finished, unless keeping them is useful for debugging.
+
+Use FFmpeg filters such as `scale`, `fps`, `format`, `drawtext`, `overlay`, `fade`, `xfade`, and `acrossfade` where appropriate.
+
+### Octocat
+
+Assume I will provide an Octocat PNG/SVG asset in the project directory, for example:
+
+```text
+assets/octocat.png
+```
+
+Don't download an Octocat automatically. Make the asset path configurable.
+
+### Typography
+
+Use a clean sans-serif font. Make the font path configurable rather than assuming a specific font exists on the system.
+
+The game title should be larger/bolder than the username and placement.
+
+Example:
+
+```text
+┌──────────────────────────────────────────────┐
+│                                              │
+│              GAMEPLAY                        │
+│                                              │
+│                                              │
+│  [Octocat]  GAME NAME                        │
+│             @githubusername  •  1st Place    │
+└──────────────────────────────────────────────┘
+```
+
+### Important
+
+Before writing the final script:
+
+1. Inspect the project directory and determine the actual clip filenames and CSV format.
+2. Check the video properties of all clips with `ffprobe`.
+3. scIdentify any compatibility problems between clips.
+4. Choose a sensible common output resolution and frame rate based on the source footage.
+5. Explain the approach briefly.
+6. Then create the script and test it against the actual files.
+
+Favor **simple, maintainable FFmpeg commands** over an extremely complicated filter graph. If FFmpeg's filter graph becomes unwieldy, use intermediate rendered clips and then combine them.
+
+The final result should look polished enough to publish as a GitHub/Game Off highlight reel.
