@@ -1,135 +1,397 @@
-I have 13 short gameplay video clips that I want to combine into a polished highlight reel using **FFmpeg**.
+# Create a polished, seamlessly looping js13kGames 2026 highlight reel with FFmpeg
 
-Videos are videos folder.
+I have 13 gameplay video clips representing the top 13 winners of js13kGames 2026. The theme was **Unicorns & Rainbows**.
 
-### Input
+I want a polished, professional highlight reel that feels like a GitHub Universe or indie game showcase video.
 
-There are 13 video clips in a directory. Each clip corresponds to one game.
+The main improvements I want are:
 
-I also have a CSV containing metadata for each clip with columns similar to:
+1. A beautifully designed, animated lower third for every game.
+2. Smooth, understated transitions between games.
+3. A genuinely seamless video and audio loop that transitions from the 13th game back to the 1st.
+4. High-quality output suitable for X/Twitter, GitHub, and event displays.
 
-```csv
-place,game,github_username
-1,Game Name,username
-2,Another Game,anotheruser
-3,Third Game,thirduser
-...
-```
+**Important:** Modify and improve my existing implementation rather than rewriting everything unnecessarily. The existing `make-montage.sh` invokes `scripts/montage.py`. Inspect that Python implementation before making changes.
 
-CSV file is called `data.csv`.
+## 1. Inputs and project inspection
 
-The CSV order should determine the order of the clips in the final video.
+My project contains:
 
-The clips are approximately 13 seconds each, but don't assume they are identical in resolution, frame rate, codec, or audio format.
+- `videos/`: 13 gameplay clips.
+- `data.csv`: placement, game titles, and GitHub usernames.
+- `assets/octocat.png`: the GitHub Octocat logo.
+- `make-montage.sh`: the existing command-line entry point.
+- `scripts/montage.py`: the video generation implementation.
 
-### Goal
+The expected command is:
 
-Create one polished video montage from all 13 clips.
+`./make-montage.sh videos/ data.csv output.mp4`
 
-The result should feel like a **GitHub Game Off / indie game showcase reel** rather than simply concatenating the videos.
+Before making changes:
 
-### Visual design
+- Inspect the actual project and relevant files.
+- Examine the CSV columns and determine how filenames map to game titles.
+- Use ffprobe to inspect every clip's dimensions, duration, frame rate, codecs, and audio streams.
+- Identify any source compatibility issues.
+- Choose sensible output dimensions and frame rate based on the input footage.
+- Preserve the CSV order.
+- Keep every game's footage in the final loop, including the portions used by transitions.
 
-For each clip:
+Avoid guessing filename mappings when multiple clips could match the same game.
 
-* Show the gameplay full-screen.
-* Add a tasteful **lower-third overlay** near the bottom of the screen.
-* The lower third should contain:
+## 2. Visual direction: Beautiful, modern lower thirds
 
-  * The game's title prominently.
-  * The creator's GitHub username, prefixed with `@`.
-  * The creator's placement, such as `1st`, `2nd`, `3rd`, etc., where appropriate.
-* Include a small **GitHub Octocat** icon/logo as part of the lower-third design.
-* The lower third should be visually clean and modern, with good contrast against arbitrary gameplay footage.
-* Add a subtle translucent background/gradient behind the text if necessary for readability.
-* Keep the overlay away from important gameplay UI where possible.
-* Don't make the lower third too large or distracting.
+This is the most important visual improvement.
 
-### Transitions
+**Design aesthetic:** GitHub Universe meets Apple TV sports graphics, with a little indie-game personality.
 
-Use attractive, professional transitions between clips rather than hard cuts.
+The lower third should look deliberately designed, not like text placed over a generic black box.
 
-Prefer something subtle and energetic, such as:
+Use a restrained, premium visual style with beautiful typography, consistent alignment, generous internal spacing, and subtle visual hierarchy.
 
-* short crossfades
-* subtle zoom/push transitions
-* directional wipes
-* or another transition that can be implemented reliably with FFmpeg
+### Layout
 
-Keep transitions relatively short, around 0.5–1 second. The gameplay should remain the focus.
+Position the lower third toward the bottom-left of the video, respecting safe margins.
 
-Don't use cheesy PowerPoint-style transitions.
+Each lower third contains:
 
-### Timing
+- A circular GitHub avatar for the creator.
+- The game title in large, bold Mona Sans.
+- The creator's GitHub username, prefixed with `@`.
+- A compact placement label such as `1ST PLACE`, `2ND PLACE`, or `13TH PLACE`.
+- A small GitHub Octocat icon.
 
-Each clip should play in its entirety unless there is a technical reason not to.
+Suggested visual composition:
 
-The transition should overlap the end of one clip and beginning of the next so the final video doesn't become unnecessarily long.
+`[Avatar]  GAME TITLE`
 
-### Technical requirements
+`          @username   [1ST PLACE]        [Octocat]`
 
-Build this as a reproducible script, preferably:
+The game title should be the strongest visual element.
 
-```bash
-./make-montage.sh clips/ games.csv output.mp4
-```
+The username is smaller and secondary.
 
-or an equivalent Python script that invokes FFmpeg.
+The placement should be presented as a small, elegant badge, not oversized text.
 
-The script should:
-
-1. Read the CSV.
-2. Match each CSV row to the appropriate video clip.
-3. Sort clips according to placement/order in the CSV.
-4. Normalize video dimensions, frame rate, pixel format, and audio format as necessary.
-5. Add the lower-third graphics and Octocat to each clip.
-6. Apply transitions between clips.
-7. Encode a final MP4 suitable for sharing on the web.
-8. Handle clips with different resolutions, frame rates, orientations, or missing audio gracefully.
-9. Clean up temporary files when finished, unless keeping them is useful for debugging.
-
-Use FFmpeg filters such as `scale`, `fps`, `format`, `drawtext`, `overlay`, `fade`, `xfade`, and `acrossfade` where appropriate.
-
-### Octocat
-
-Assume I will provide an Octocat PNG/SVG asset in the project directory, for example:
-
-```text
-assets/octocat.png
-```
-
-Don't download an Octocat automatically. Make the asset path configurable.
+The Octocat should be recognizable but subtle. It should not compete with the game title or avatar.
 
 ### Typography
 
-Use a clean sans-serif font. Make the font path configurable rather than assuming a specific font exists on the system.
+Use **Mona Sans** consistently.
 
-The game title should be larger/bolder than the username and placement.
+At 1920×1080, aim for approximately:
 
-Example:
+- Game title: 42–48 px, bold.
+- GitHub username: 24–26 px, medium.
+- Placement badge: 18–21 px, semibold.
+- Avatar: approximately 60–68 px diameter.
+- Octocat: approximately 22–26 px.
 
-```text
-┌──────────────────────────────────────────────┐
-│                                              │
-│              GAMEPLAY                        │
-│                                              │
-│                                              │
-│  [Octocat]  GAME NAME                        │
-│             @githubusername  •  1st Place    │
-└──────────────────────────────────────────────┘
-```
+Scale proportionally for other output resolutions.
 
-### Important
+Maintain consistent line height, letter spacing, baseline alignment, and padding.
 
-Before writing the final script:
+Support long game titles without text overflow. Reduce title size gracefully or wrap to a maximum of two lines, preserving the rest of the layout.
 
-1. Inspect the project directory and determine the actual clip filenames and CSV format.
-2. Check the video properties of all clips with `ffprobe`.
-3. scIdentify any compatibility problems between clips.
-4. Choose a sensible common output resolution and frame rate based on the source footage.
-5. Explain the approach briefly.
-6. Then create the script and test it against the actual files.
+Do not let any text or graphics overlap.
 
-Favor **simple, maintainable FFmpeg commands** over an extremely complicated filter graph. If FFmpeg's filter graph becomes unwieldy, use intermediate rendered clips and then combine them.
+### Lower-third background
 
-The final result should look polished enough to publish as a GitHub/Game Off highlight reel.
+Use a **subtle translucent charcoal or graphite background**, with an elegant gradient that fades toward the right.
+
+Preferred treatment:
+
+- Background based on GitHub dark UI colors such as `#0D1117`.
+- Approximately 78–88% opacity in the core text area.
+- Soft, feathered gradient toward the transparent edge.
+- Rounded corners, approximately 14–18 px.
+- Extremely subtle light border or highlight.
+- Very soft drop shadow to separate the panel from gameplay.
+- Optional 3–4 px vertical accent line in GitHub green (`#7EE787`).
+- No heavy outlines around the text.
+
+The result should remain readable over colorful, dark, or busy gameplay without looking like a giant opaque banner.
+
+Avoid excessive glassmorphism, neon outlines, rainbow-colored text, thick borders, or oversized gradients.
+
+Although the competition theme is Unicorns & Rainbows, the lower thirds should remain restrained. Let the gameplay provide the color.
+
+### Size and positioning
+
+For 1920×1080:
+
+- Keep the lower third under approximately 750 px wide.
+- Aim for around 130–155 px high.
+- Use approximately 50–65 px left and bottom margins.
+- Never occupy more than approximately 15% of the video's height.
+- Keep the rest of the screen unobstructed.
+
+Do not crop gameplay unnecessarily to make room for graphics.
+
+If a game has important HUD elements in the bottom-left, allow its lower third to move to the bottom-right using an optional per-game position override.
+
+Do not cover essential gameplay controls, scores, or captions.
+
+### User avatars
+
+Fetch each creator's avatar from:
+
+`https://github.com/USERNAME.png`
+
+Use the username from the CSV, removing an existing `@` prefix before building the URL.
+
+- Download and cache each avatar locally.
+- Crop it into a perfect circle.
+- Preserve image quality.
+- Add a subtle thin border.
+- Do not stretch or distort avatars.
+- If an avatar fails to download, use a tasteful fallback with the creator's initials.
+- Never block the whole montage because of one missing avatar.
+
+Do not download an Octocat automatically. Use the supplied asset, with its path configurable.
+
+## 3. Lower-third animation
+
+Animate the lower third in a subtle, professional way.
+
+### Entrance
+
+At the beginning of each game's appearance:
+
+- Fade the lower third in over approximately 200–300 ms.
+- Simultaneously move it upward approximately 12–18 px.
+- Use gentle ease-out timing rather than linear or bouncy motion.
+- Optionally stagger the title and secondary text by 60–100 ms.
+
+The animation should feel smooth and deliberate.
+
+### While playing
+
+- Hold the lower third steadily.
+- Avoid continuous pulsing, scaling, glowing, or unnecessary movement.
+- Keep text readable long enough for viewers to identify each game.
+
+### Exit
+
+- Fade out gently over approximately 200–250 ms.
+- Use a small downward movement if it improves the result.
+- Coordinate the exit with the transition to the next game.
+
+**Critical:** Avoid having two lower thirds visibly overlap during a crossfade. The outgoing lower third should disappear before the incoming lower third becomes prominent.
+
+For the seamless loop, the first game's lower third must also be visually continuous across the exported video's beginning/end boundary.
+
+## 4. Build graphics separately from gameplay
+
+Favor maintainable, reproducible implementation over a complicated FFmpeg filter graph.
+
+Use Python with Pillow, SVG rendering, or another suitable image-composition library to generate transparent lower-third assets.
+
+Then use FFmpeg to animate and composite the overlays.
+
+Recommended approach:
+
+1. Read each game's metadata.
+2. Download/cache its avatar.
+3. Generate a transparent lower-third PNG.
+4. Add its entrance, hold, and exit animation with FFmpeg.
+5. Produce normalized intermediate clips.
+6. Assemble those clips with transitions.
+
+It is acceptable to use FFmpeg expressions for opacity and position.
+
+Do not add major new dependencies without a good reason.
+
+## 5. Gameplay presentation
+
+The gameplay should remain the focus.
+
+- Preserve aspect ratio.
+- Normalize frame rate, pixel format, resolution, and audio.
+- Use 1920×1080 at 30 or 60 fps if appropriate for the source footage.
+- Prefer high-quality scaling.
+- Avoid stretching or cropping important gameplay.
+- For unusual aspect ratios, use a tasteful blurred extension of the same gameplay as background.
+- Do not add artificial cinematic black bars unless absolutely necessary.
+- Preserve each clip's timing and playback speed.
+
+All games should remain recognizable and visually sharp.
+
+## 6. Transitions
+
+Use understated, polished transitions, typically around **0.65 seconds**.
+
+Preferred transition: a smooth, short crossfade.
+
+You may occasionally use a restrained directional push if it genuinely improves the sequence, but visual consistency is more important than having lots of different effects.
+
+Avoid:
+
+- Spinning transitions.
+- Page curls.
+- Flashy zooms.
+- Artificial glitch effects.
+- Excessively bright white flashes.
+- Long dissolves that obscure gameplay.
+- Cheesy PowerPoint-style wipes.
+
+Use FFmpeg's `xfade` or an equivalent reliable implementation.
+
+Transitions should overlap adjacent clips rather than lengthen the timeline.
+
+## 7. Critical requirement: A truly seamless infinite loop
+
+**The finished montage must be designed to repeat continuously without an obvious reset, jump, flash, audio pop, or interruption.**
+
+The last game must transition smoothly back into the first game.
+
+Simply adding a normal ending fade and starting again at the first frame is not acceptable.
+
+### Recommended loop construction
+
+Build the montage as a cyclic sequence:
+
+`Game 1 → Game 2 → ... → Game 13 → Game 1`
+
+Add the same approximately 0.65-second transition between Game 13 and the repeated Game 1 as between the other games.
+
+But do not export the repeated first game in its entirety.
+
+Instead:
+
+1. Normalize and prepare all 13 source clips, including their lower thirds and audio.
+2. Assemble the sequence of 13 clips and repeat the first clip once at the end.
+3. Crossfade all adjacent clips, including Game 13 into the repeated Game 1.
+4. Choose a loop seam within Game 1, ideally around 1–2 seconds into its footage, away from an active transition or lower-third animation.
+5. Trim the completed cyclic montage so that it begins at that position within the original Game 1 and ends at the corresponding position within the repeated Game 1.
+6. Ensure these two points refer to the same source footage timestamp, with identical overlay state and audio timeline.
+7. Export only one complete cycle.
+
+This means Game 1 is split across the file boundary, which is intentional.
+
+When playback loops, the end of the repeated Game 1 flows naturally into the beginning of the original Game 1.
+
+The viewer should see the complete sequence of all 13 games, including a proper Game 13 → Game 1 transition, without Game 1 playing twice in each cycle.
+
+**Important:** Compute transition offsets using actual probed or normalized durations. Do not assume every source is exactly 13 seconds.
+
+### Loop seam quality
+
+Choose a seam where:
+
+- The first game's gameplay is visually stable.
+- The lower third has completed its entrance animation.
+- There is no scene change or unusually abrupt camera movement.
+- Both sides have matching overlay, avatar, typography, and visual state.
+- Audio remains continuous.
+
+Do not place the loop boundary in the middle of a title animation, dissolve, or a fade to black.
+
+The final frame and opening frame should represent consecutive moments of the same gameplay sequence.
+
+Verify the boundary at the final encoded frame rate, not just with approximate timestamps.
+
+### Audio looping
+
+Apply the same cyclic approach to audio.
+
+- Normalize audio to stereo, 48 kHz.
+- Handle silent clips by generating silent audio.
+- Use short audio crossfades between games where appropriate.
+- Ensure the final audio sample flows cleanly into the first audio sample.
+- Avoid audible clicks, pops, or volume spikes.
+- Preserve audiovisual synchronization.
+
+If optional background music is supplied, it must also loop seamlessly, with its own crossfade or appropriate musical edit.
+
+Do not download or invent background music.
+
+## 8. Encoding and technical quality
+
+Export an MP4 suitable for web and social sharing.
+
+Recommended:
+
+- Video codec: H.264 / libx264.
+- Pixel format: yuv420p.
+- Audio codec: AAC.
+- Audio sampling: 48 kHz stereo.
+- Constant frame rate.
+- CRF around 18–20.
+- Encoding preset: slow or medium.
+- Fast-start metadata (`+faststart`).
+
+Maintain high-quality gradients, readable text, and sharp gameplay.
+
+Make output resolution, frame rate, transition length, avatar caching, and Octocat path configurable.
+
+## 9. Verification and previews
+
+Test everything against the actual files, not just a synthetic example.
+
+Verify:
+
+- All 13 games appear in CSV order.
+- Every title matches the CSV.
+- Every placement is correct.
+- Every username has exactly one `@` prefix.
+- Avatars are correct or show appropriate fallbacks.
+- The Octocat displays correctly.
+- Long titles fit.
+- Lower thirds are legible over light and dark gameplay.
+- Lower thirds do not overlap one another during transitions.
+- No gameplay is accidentally sped up or truncated.
+- The output has no unexpected black frames.
+- The video and audio remain synchronized.
+- All transitions work correctly.
+- The first and last frames are temporally continuous when repeated.
+
+Also generate:
+
+**`lower-third-preview.png`**
+
+A representative screenshot showing the improved lower third over actual gameplay.
+
+**`montage-contact-sheet.jpg`**
+
+A contact sheet showing a representative frame from all 13 games, with their lower thirds.
+
+**`loop-test.mp4`**
+
+A short preview formed by joining approximately the final 2 seconds of the exported montage to its first 2 seconds.
+
+This preview must show the actual loop boundary so I can visually verify that it is seamless.
+
+Do not merely compare the first and last frames for exact equality. Verify continuous motion and consistent audio across the wraparound boundary.
+
+## 10. Implementation requirements
+
+Keep the code readable, maintainable, and robust.
+
+Use temporary intermediate files when they simplify the implementation.
+
+- Clean up temporary files after successful completion.
+- Provide an option to preserve them for debugging.
+- Cache downloaded avatars.
+- Provide actionable error messages for missing fonts, assets, or clips.
+- Do not silently skip games.
+- Avoid complex FFmpeg filter graphs if simpler intermediate rendering produces a more reliable result.
+- Reuse the existing script structure where possible.
+
+Document any new dependencies and configuration options.
+
+## 11. Final deliverables
+
+Create:
+
+- `output.mp4`: the polished, seamlessly looping 13-game montage.
+- `lower-third-preview.png`: preview of the visual design.
+- `montage-contact-sheet.jpg`: all 13 games.
+- `loop-test.mp4`: demonstration of the seamless loop.
+- Updated reproducible Python/FFmpeg scripts.
+
+Briefly explain the changes made to the lower-third design and how the seamless looping technique works.
+
+**Final quality bar:** The result should look like something GitHub would proudly play on a large screen at Universe or post on its official social channels. It should feel sophisticated, clean, playful, and developer-first.
+
+Prioritize beautiful lower thirds, excellent typography, gameplay visibility, and an imperceptible looping boundary over unnecessary effects.

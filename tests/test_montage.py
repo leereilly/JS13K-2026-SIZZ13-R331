@@ -1,20 +1,32 @@
 import csv
+import io
 import json
+import os
 import tempfile
 import unittest
+import urllib.error
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from PIL import Image
 
 from scripts.montage import (
     MediaInfo,
+    MontageError,
     MontageConfig,
+    avatar_cache_path,
     build_combine_command,
+    calculate_cycle_timing,
     calculate_transition_offsets,
+    fallback_initials,
+    fetch_avatar,
     normalize_username,
     parse_csv,
     parse_place_number,
     probe_media,
+    render_lower_third,
+    load_avatar_or_fallback,
 )
 
 
@@ -78,6 +90,26 @@ class CsvTests(unittest.TestCase):
     def test_username_normalization(self):
         self.assertEqual("@name", normalize_username("name"))
         self.assertEqual("@name", normalize_username("@@name"))
+        with self.assertRaisesRegex(ValueError, "invalid GitHub username"):
+            normalize_username("../name")
+
+    def test_position_override(self):
+        for number in (1, 2):
+            (self.clips / f"{number}.mp4").touch()
+        path = self.root / "positions.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(HEADERS + ["Lower third position"])
+            writer.writerows([["1st", "Left", "one", ""], ["2nd", "Right", "two", "bottom-right"]])
+        rows = parse_csv(path, self.clips)
+        self.assertEqual(["bottom-left", "bottom-right"], [row.position for row in rows])
+        self.assertEqual(["one", "two"], [row.github_login for row in rows])
+        path.write_text(
+            ",".join(HEADERS + ["Lower third position"]) + "\n1st,A,one,center\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "bottom-left or bottom-right"):
+            parse_csv(path, self.clips)
 
 
 class ProbeAndTimingTests(unittest.TestCase):
@@ -115,7 +147,7 @@ class ProbeAndTimingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shorter"):
             calculate_transition_offsets([Decimal("1"), Decimal("0.5")], Decimal("0.5"))
 
-    def test_combine_graph_uses_offset_xfade_chain_without_trimming(self):
+    def test_cyclic_graph_repeats_first_and_trims_exact_cycle(self):
         with tempfile.TemporaryDirectory(dir=".") as temp:
             root = Path(temp)
             filter_path = root / "filter.txt"
@@ -141,18 +173,199 @@ class ProbeAndTimingTests(unittest.TestCase):
             )
             graph = filter_path.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "[0:v][1:v]xfade=transition=fade:duration=0.75:offset=2.5[v1]",
-            graph,
-        )
-        self.assertIn(
-            "[v1][2:v]xfade=transition=fade:duration=0.75:offset=7.25[vout]",
-            graph,
-        )
-        self.assertIn("[0:a][1:a]acrossfade=d=0.75:c1=tri:c2=tri[a1]", graph)
-        self.assertIn("[a1][2:a]acrossfade=d=0.75:c1=tri:c2=tri[a2]", graph)
-        self.assertNotIn("trim=", graph)
+        self.assertEqual(3, graph.count("xfade=transition=fade"))
+        self.assertEqual(3, graph.count("acrossfade="))
+        self.assertIn("[vx2][3:v]xfade=", graph)
+        self.assertIn("trim=start_frame=45:end_frame=303", graph)
+        self.assertIn("atrim=start_sample=72000:end_sample=484800", graph)
         self.assertNotIn("concat=", graph)
+
+    def test_frame_domain_cycle_math(self):
+        timing = calculate_cycle_timing([390] * 13, 30, Decimal("0.65"), Decimal("1.5"))
+        self.assertEqual(20, timing.transition_frames)
+        self.assertEqual(45, timing.seam_frame)
+        self.assertEqual(4810, timing.cycle_frames)
+        self.assertEqual(1600, timing.samples_per_frame)
+        self.assertEqual(7_696_000, timing.cycle_samples)
+        unequal = calculate_cycle_timing([100, 120], 30, Decimal(".2"), Decimal("0.5"))
+        self.assertEqual(208, unequal.cycle_frames)
+        with self.assertRaisesRegex(ValueError, "loop seam"):
+            calculate_cycle_timing([100, 100], 30, Decimal(".2"), Decimal(".1"))
+        with self.assertRaisesRegex(ValueError, "divide 48000"):
+            calculate_cycle_timing([100], 29, Decimal(".2"), Decimal("1"))
+
+
+class AvatarAndGraphicsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=".")
+        self.root = Path(self.temp.name)
+        font = Path(os.environ.get("MONTAGE_TEST_FONT", "/Library/Fonts/MonaSans-Regular.ttf"))
+        bold = Path(os.environ.get("MONTAGE_TEST_FONT_BOLD", "/Library/Fonts/MonaSans-Bold.ttf"))
+        if not font.is_file() or not bold.is_file():
+            self.skipTest("Mona Sans test fonts unavailable")
+        logo = self.root / "logo.png"
+        Image.new("RGBA", (32, 32), "white").save(logo)
+        self.config = MontageConfig(
+            self.root, self.root / "data.csv", self.root / "out.mp4", logo, font,
+            1920, 1080, 30, Decimal(".65"), False, False,
+            avatar_cache=self.root / "cache", offline=True, font_bold_path=bold,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def row(self, *, title="A Beautiful Game", position="bottom-left"):
+        return __import__("scripts.montage", fromlist=["GameRow"]).GameRow(
+            2, "1st", 1, title, "@Octo-Cat", self.root / "1.mp4", "Octo-Cat", position
+        )
+
+    def test_cache_hit_and_deterministic_fallback(self):
+        target = avatar_cache_path("@Octo-Cat", self.config.cache_path)
+        target.parent.mkdir()
+        Image.new("RGB", (100, 80), "purple").save(target)
+        with patch("scripts.montage.urllib.request.urlopen") as request:
+            self.assertEqual(target, fetch_avatar("Octo-Cat", self.config))
+            request.assert_not_called()
+        self.assertEqual("OC", fallback_initials("Octo-Cat"))
+        target.unlink()
+        avatar = load_avatar_or_fallback(self.row(), self.config, 64)
+        self.assertEqual((64, 64), avatar.size)
+        self.assertEqual(0, avatar.getpixel((0, 0))[3])
+
+    def image_response(self, color="green"):
+        buffer = io.BytesIO()
+        Image.new("RGB", (40, 40), color).save(buffer, format="PNG")
+        response = MagicMock()
+        response.headers.get_content_type.return_value = "image/png"
+        response.read.return_value = buffer.getvalue()
+        response.__enter__.return_value = response
+        return response
+
+    def test_download_populates_verified_cache_and_renders_real_avatar(self):
+        response = self.image_response()
+        with patch("scripts.montage.urllib.request.urlopen", return_value=response) as opener:
+            online = __import__("dataclasses").replace(self.config, offline=False)
+            path = fetch_avatar("Octo-Cat", online)
+        self.assertTrue(path and path.is_file())
+        with Image.open(path) as cached:
+            cached.verify()
+        avatar = load_avatar_or_fallback(self.row(), online, 64)
+        self.assertEqual((0, 128, 0, 255), avatar.getpixel((32, 32)))
+        request = opener.call_args.args[0]
+        self.assertEqual("https://github.com/Octo-Cat.png?size=256", request.full_url)
+        self.assertIn("image/png", request.get_header("Accept"))
+        self.assertTrue(request.get_header("User-agent").startswith("js13k-montage/"))
+        self.assertEqual(8.0, opener.call_args.kwargs["timeout"])
+        self.assertFalse(list(path.parent.glob("*.partial")))
+
+    def test_corrupt_cache_is_recovered_online_atomically(self):
+        target = avatar_cache_path("Octo-Cat", self.config.cache_path)
+        target.parent.mkdir()
+        target.write_bytes(b"not an image")
+        online = __import__("dataclasses").replace(self.config, offline=False)
+        with patch("scripts.montage.urllib.request.urlopen", return_value=self.image_response("red")):
+            with self.assertWarnsRegex(UserWarning, "downloading a replacement"):
+                path = fetch_avatar("@@Octo-Cat", online)
+        self.assertEqual(target, path)
+        with Image.open(target) as cached:
+            self.assertEqual((255, 0, 0), cached.convert("RGB").getpixel((20, 20)))
+        self.assertFalse(list(target.parent.glob("*.partial")))
+
+    def test_avatar_download_failures_warn_and_fallback(self):
+        online = __import__("dataclasses").replace(self.config, offline=False)
+        failures = (
+            TimeoutError("timed out"),
+            urllib.error.URLError("DNS unavailable"),
+            urllib.error.HTTPError(
+                "https://github.com/Octo-Cat.png", 503, "Service Unavailable", {}, None
+            ),
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                with patch("scripts.montage.urllib.request.urlopen", side_effect=failure):
+                    with self.assertWarnsRegex(
+                        UserWarning, r"@Octo-Cat.*failed.*using initials fallback"
+                    ):
+                        self.assertIsNone(fetch_avatar("Octo-Cat", online))
+
+    def test_invalid_image_responses_warn_and_fallback(self):
+        online = __import__("dataclasses").replace(self.config, offline=False)
+        responses = (self.image_response(), self.image_response())
+        responses[0].headers.get_content_type.return_value = "text/html"
+        responses[1].read.return_value = b"not an image"
+        for response in responses:
+            with self.subTest(content_type=response.headers.get_content_type()):
+                with patch("scripts.montage.urllib.request.urlopen", return_value=response):
+                    with self.assertWarnsRegex(
+                        UserWarning, r"@Octo-Cat.*failed.*using initials fallback"
+                    ):
+                        self.assertIsNone(fetch_avatar("Octo-Cat", online))
+
+    def test_failed_refresh_retains_valid_cached_avatar(self):
+        target = avatar_cache_path("Octo-Cat", self.config.cache_path)
+        target.parent.mkdir()
+        Image.new("RGB", (40, 40), "green").save(target)
+        refreshing = __import__("dataclasses").replace(
+            self.config, offline=False, refresh_avatars=True
+        )
+        with patch(
+            "scripts.montage.urllib.request.urlopen", side_effect=TimeoutError("timed out")
+        ):
+            with self.assertWarnsRegex(UserWarning, r"@Octo-Cat.*using cached avatar"):
+                self.assertEqual(target, fetch_avatar("Octo-Cat", refreshing))
+        with Image.open(target) as cached:
+            self.assertEqual((0, 128, 0), cached.convert("RGB").getpixel((20, 20)))
+
+    def test_renderer_has_safe_mirrored_positions_and_nonoverlap(self):
+        avatar = Image.new("RGBA", (64, 64), "blue")
+        left_path, right_path = self.root / "left.png", self.root / "right.png"
+        left = render_lower_third(self.row(title="A Deliberately Long Beautiful Rainbow Game"),
+                                  avatar, self.config, left_path)
+        right = render_lower_third(self.row(position="bottom-right"), avatar, self.config, right_path)
+        self.assertLessEqual(left.height, int(1080 * .15) + 20)  # includes soft-shadow padding
+        self.assertEqual(60 - 10, left.x)
+        self.assertEqual(1920 - 60 - 750 - 10, right.x)
+        self.assertEqual(
+            "A Deliberately Long Beautiful Rainbow Game", " ".join(left.title_lines)
+        )
+        self.assertGreater(left.username_bounds[2] - left.username_bounds[0], 0)
+        self.assertLess(left.username_bounds[2], left.octocat_bounds[0])
+        with Image.open(left_path) as image:
+            self.assertEqual("RGBA", image.mode)
+            self.assertGreater(image.getbbox()[2], 0)
+            avatar_center = (
+                (left.avatar_bounds[0] + left.avatar_bounds[2]) // 2,
+                (left.avatar_bounds[1] + left.avatar_bounds[3]) // 2,
+            )
+            octocat_center = (
+                (left.octocat_bounds[0] + left.octocat_bounds[2]) // 2,
+                (left.octocat_bounds[1] + left.octocat_bounds[3]) // 2,
+            )
+            self.assertEqual((0, 0, 255), image.getpixel(avatar_center)[:3])
+            self.assertEqual((255, 255, 255), image.getpixel(octocat_center)[:3])
+            alpha = image.getchannel("A")
+            shadow_pad = 10
+            panel_right = shadow_pad + 750 - 1
+            # The transparent rounded panel never writes into right shadow
+            # padding. Only a low-alpha, blurred shadow may occupy that envelope.
+            right_padding = alpha.crop((panel_right + 1, 0, image.width, image.height))
+            self.assertLess(right_padding.getextrema()[1], 32)
+            self.assertLessEqual(alpha.getpixel((panel_right, shadow_pad)), 2)
+            self.assertLessEqual(alpha.getpixel((panel_right, shadow_pad + 149)), 2)
+            self.assertEqual(0, alpha.getpixel((image.width - 1, 0)))
+            self.assertEqual(0, alpha.getpixel((image.width - 1, image.height - 1)))
+
+    def test_renderer_omits_all_placement_visuals(self):
+        avatar = Image.new("RGBA", (64, 64), "blue")
+        first_path = self.root / "first.png"
+        thirteenth_path = self.root / "thirteenth.png"
+        first = self.row()
+        thirteenth = __import__("dataclasses").replace(first, place="13th", place_number=13)
+        render_lower_third(first, avatar, self.config, first_path)
+        render_lower_third(
+            thirteenth, avatar, self.config, thirteenth_path
+        )
+        self.assertEqual(first_path.read_bytes(), thirteenth_path.read_bytes())
 
 
 if __name__ == "__main__":

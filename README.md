@@ -1,24 +1,22 @@
 # JS13K Gameplay Montage
 
-`make-montage.sh` builds a deterministic, web-shareable MP4 in the order of
-the CSV rows. Each clip is normalized and shown full-screen (portrait and
-square gameplay use a blurred full-frame background), with a branded lower
-third, normalized audio, repeatable fade transitions, and audio crossfades.
+`make-montage.sh` builds a polished, web-shareable montage in CSV row order.
+Gameplay is aspect-fit over a blurred extension, normalized to a constant frame
+rate with 48 kHz stereo audio, and presented with animated GitHub-style lower
+thirds. The exported timeline is a true video **and audio** cycle.
 
 ## Requirements
 
-- Python 3.10+
-- FFmpeg and FFprobe with `libx264`, AAC, `overlay`, `xfade`, and
-  `acrossfade`
-- librsvg (`rsvg-convert`), used to safely render arbitrary CSV text and the
-  configured logo into lower-thirds
-- A readable TTF/OTF font and Octocat/logo image. PNG is most portable;
-  ImageMagick-supported SVG also works.
+- Python 3.10+ and Pillow (`python3 -m pip install -r requirements.txt`)
+- FFmpeg/FFprobe with `libx264`, AAC, `overlay`, `xfade`, and `acrossfade`
+- Mona Sans regular and bold TTF/OTF files
+- `rsvg-convert` when the configured Octocat is SVG
 
-On macOS with Homebrew:
+On macOS:
 
 ```bash
 brew install ffmpeg librsvg
+python3 -m pip install -r requirements.txt
 ```
 
 ## Usage
@@ -26,45 +24,90 @@ brew install ffmpeg librsvg
 ```bash
 ./make-montage.sh videos/ data.csv output.mp4 \
   --octocat assets/GitHub_Invertocat_White.svg \
-  --font /System/Library/Fonts/Supplemental/Verdana.ttf
+  --font /Library/Fonts/MonaSans-Regular.ttf \
+  --font-bold /Library/Fonts/MonaSans-Bold.ttf
 ```
 
-The asset paths may instead be supplied as `OCTOCAT_PATH` and `FONT_PATH`;
-command-line flags take precedence. Run `./make-montage.sh --help` for output
-size, frame rate, transition, quality, and encoder-preset options.
+The repository white Octocat and installed `/Library/Fonts/MonaSans-*.ttf`
+paths are discovered by default. `OCTOCAT_PATH`, `FONT_PATH`, and
+`FONT_BOLD_PATH` are also supported; explicit flags win.
 
-By default an existing output is rejected. Use `--force` to replace it.
-`--keep-temp` preserves the output-adjacent `.montage-work-*` directory for
-diagnostics. Without it, work files and partial output are removed on both
-success and failure.
+Useful options:
+
+- `--width`, `--height`, `--fps`, `--transition-duration` (default 0.65 s)
+- `--loop-seam` (default 1.5 s into Game 1)
+- `--avatar-cache`, `--avatar-timeout`, `--refresh-avatars`, `--offline`
+- `--crf`, `--preset`, `--keep-temp`, `--force`, `--verbose`
+
+`--force` applies to all four deliverables. Publication is atomic: existing
+deliverables are left in place if rendering fails. `--keep-temp` preserves the
+output-adjacent `.montage-work-*` directory; otherwise intermediates and
+partial files are removed.
 
 ## CSV format
 
-These headers are required:
-
 ```csv
-Place,Game title,GitHub usernames with @ that created it
-2nd,"A title, with a comma",maker
-1st,Another Game,@creator
+Place,Game title,GitHub usernames with @ that created it,Lower third position
+2nd,"A title, with a comma",maker,bottom-right
+1st,Another Game,@creator,bottom-left
 ```
 
-Parsing uses Python's CSV implementation, including correct handling for
-quoted commas, quotes, Unicode, CRLF, and UTF-8 BOMs. Surrounding whitespace is
-trimmed. CSV row order controls playback order; the leading positive number in
-`Place` selects `<number>.mp4`. In the example, `2.mp4` plays before `1.mp4`.
-A single leading `@` is added to usernames when needed.
+The first three headers are required. `Lower third position` is optional and
+accepts `bottom-left` (the default) or `bottom-right`. CSV order controls
+playback; the leading placement number selects `<number>.mp4`, so filenames
+are never guessed from titles. Placement values are not displayed in the
+lower third. Usernames are validated and displayed with exactly one `@`.
 
-## Output and media handling
+## Lower thirds and avatars
 
-Defaults are H.264/yuv420p at 1920×1080 and 30 fps, plus AAC 48 kHz stereo,
-with `faststart` enabled. Landscape, portrait, resolution, and frame-rate
-differences are normalized. Existing audio is resampled, converted to stereo,
-and loudness-normalized; missing audio is replaced with silence so transitions
-remain reliable.
+Pillow composes a panel-sized RGBA graphic with a circular avatar, fitted
+one- or two-line title, GitHub username, and configured Octocat branding. The
+charcoal rounded panel has a soft shadow, subtle border and rightward fade,
+plus a GitHub-green accent. It eases upward and fades in after the incoming
+transition, then fades and eases down before the outgoing transition,
+preventing two titles from overlapping.
 
-Output dimensions must be positive even numbers. Transition duration must be
-shorter than every adjacent clip. Errors identify validation, probe,
-lower-third, segment, or combine stages and include the relevant file.
+Avatars are loaded cache-first from `https://github.com/USERNAME.png`.
+Redirects are followed, downloads are bounded, and decoded image content is
+validated before atomic caching. Corrupt cache entries are replaced online.
+Any per-avatar download or validation failure emits an actionable warning and
+uses initials without blocking montage generation. A valid cached avatar is
+retained if a requested refresh fails. `--offline` performs no network access
+and is fully reproducible with cached or fallback avatars. The Octocat is never
+downloaded.
+
+## Seamless cyclic timeline
+
+Transitions are quantized once to whole frames (0.65 s becomes 20 frames at
+30 fps). Audio uses a matching integer number of 48 kHz samples. The builder
+crossfades:
+
+```text
+Game 1 → … → Game 13 → repeated Game 1
+```
+
+It then extracts exactly one cycle from the configured stable seam within
+Game 1. Thus Game 1 occurs once, split over the file boundary. The final and
+first frames—and corresponding audio samples—are consecutive Game 1 moments,
+while the Game 13 → Game 1 crossfade remains inside the file. Missing source
+audio is replaced by silence; existing audio is resampled, stereo-converted,
+and loudness-normalized.
+
+FPS must divide 48,000 for sample-exact boundaries. Clip lengths are probed and
+frame aligned; unequal lengths are supported and playback speed is unchanged.
+
+## Deliverables
+
+Created beside the requested output:
+
+- `output.mp4` (or the requested filename): H.264/yuv420p, AAC, fast-start
+- `lower-third-preview.png`: actual Game 1 gameplay and composed overlay
+- `montage-contact-sheet.jpg`: 13 ordered representative gameplay frames
+- `loop-test.mp4`: decoded final ~2 seconds followed directly by first ~2
+  seconds, with no added fade at its midpoint
+
+Inspect the contact sheet for title/HUD placement and play `loop-test.mp4`
+repeatedly with audio to assess the actual wraparound.
 
 ## Tests
 
@@ -73,5 +116,6 @@ python3 -m unittest -v
 bash -n make-montage.sh
 ```
 
-The integration test creates mixed landscape/portrait and audio/silent media.
-Set `MONTAGE_TEST_FONT` when Verdana is not available.
+Tests cover CSV parsing and positions, cache/fallback behavior, graphics
+bounds, frame/sample cycle math, filter construction, mixed aspect ratios,
+missing audio, artifact generation, and media stream properties.

@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
-"""Reproducible FFmpeg gameplay montage builder."""
+"""Reproducible, cyclic FFmpeg gameplay montage builder."""
 
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
+import hashlib
+import io
 import json
-import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from html import escape
+import urllib.error
+import urllib.request
+import warnings
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from fractions import Fraction
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
+
+try:
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, UnidentifiedImageError
+except ImportError as error:  # pragma: no cover - exercised by CLI installations
+    raise SystemExit("Pillow is required; run: python3 -m pip install -r requirements.txt") from error
 
 
 PLACE_HEADER = "Place"
 TITLE_HEADER = "Game title"
 USER_HEADER = "GitHub usernames with @ that created it"
+POSITION_HEADER = "Lower third position"
 REQUIRED_HEADERS = (PLACE_HEADER, TITLE_HEADER, USER_HEADER)
+LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+SAMPLE_RATE = 48_000
+
+
+class MontageError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -36,6 +50,8 @@ class GameRow:
     title: str
     username: str
     clip_path: Path
+    github_login: str = ""
+    position: Literal["bottom-left", "bottom-right"] = "bottom-left"
 
 
 @dataclass(frozen=True)
@@ -47,6 +63,11 @@ class MediaInfo:
     width: int | None
     height: int | None
     frame_rate: Fraction | None
+    frame_count: int | None = None
+    sample_rate: int | None = None
+    channels: int | None = None
+    video_codec: str | None = None
+    audio_codec: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,10 +86,56 @@ class MontageConfig:
     crf: int = 20
     preset: str = "medium"
     verbose: bool = False
+    avatar_cache: Path | None = None
+    avatar_timeout: float = 8.0
+    refresh_avatars: bool = False
+    offline: bool = False
+    loop_seam: Decimal = Decimal("1.5")
+    font_bold_path: Path | None = None
+
+    @property
+    def preview_path(self) -> Path:
+        return self.output_path.parent / "lower-third-preview.png"
+
+    @property
+    def contact_sheet_path(self) -> Path:
+        return self.output_path.parent / "montage-contact-sheet.jpg"
+
+    @property
+    def loop_test_path(self) -> Path:
+        return self.output_path.parent / "loop-test.mp4"
+
+    @property
+    def cache_path(self) -> Path:
+        return self.avatar_cache or self.output_path.parent / ".avatar-cache"
 
 
-class MontageError(RuntimeError):
-    pass
+@dataclass(frozen=True)
+class LowerThirdLayout:
+    width: int
+    height: int
+    x: int
+    y: int
+    title_lines: tuple[str, ...]
+    title_size: int
+    avatar_bounds: tuple[int, int, int, int]
+    title_bounds: tuple[int, int, int, int]
+    username_bounds: tuple[int, int, int, int]
+    octocat_bounds: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class CycleTiming:
+    frame_counts: tuple[int, ...]
+    transition_frames: int
+    transition: Decimal
+    seam_frame: int
+    cycle_frames: int
+    samples_per_frame: int
+
+    @property
+    def cycle_samples(self) -> int:
+        return self.cycle_frames * self.samples_per_frame
 
 
 def parse_place_number(value: str) -> int:
@@ -78,11 +145,17 @@ def parse_place_number(value: str) -> int:
     return int(match.group(1))
 
 
-def normalize_username(value: str) -> str:
-    username = (value or "").strip().lstrip("@")
-    if not username:
+def bare_login(value: str) -> str:
+    login = (value or "").strip().lstrip("@")
+    if not login:
         raise ValueError("username is blank")
-    return f"@{username}"
+    if not LOGIN_RE.fullmatch(login):
+        raise ValueError(f"invalid GitHub username: {value!r}")
+    return login
+
+
+def normalize_username(value: str) -> str:
+    return f"@{bare_login(value)}"
 
 
 def parse_csv(path: Path, input_dir: Path) -> list[GameRow]:
@@ -94,37 +167,37 @@ def parse_csv(path: Path, input_dir: Path) -> list[GameRow]:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise ValueError(f"CSV {path} is empty")
-        normalized_headers = {(name or "").strip(): name for name in reader.fieldnames}
-        missing = [name for name in REQUIRED_HEADERS if name not in normalized_headers]
+        headers = {(name or "").strip(): name for name in reader.fieldnames}
+        missing = [name for name in REQUIRED_HEADERS if name not in headers]
         if missing:
             raise ValueError(f"CSV missing required header(s): {', '.join(missing)}")
-        keys = {name: normalized_headers[name] for name in REQUIRED_HEADERS}
         rows: list[GameRow] = []
         placements: set[int] = set()
         for logical_row, raw in enumerate(reader, start=2):
-            values = [
-                (raw.get(keys[PLACE_HEADER]) or "").strip(),
-                (raw.get(keys[TITLE_HEADER]) or "").strip(),
-                (raw.get(keys[USER_HEADER]) or "").strip(),
-            ]
-            if not any(values):
+            place = (raw.get(headers[PLACE_HEADER]) or "").strip()
+            title = (raw.get(headers[TITLE_HEADER]) or "").strip()
+            user = (raw.get(headers[USER_HEADER]) or "").strip()
+            if not any((place, title, user)):
                 continue
-            if not all(values):
+            if not all((place, title, user)):
                 raise ValueError(f"CSV row {logical_row} has a blank required field")
             try:
-                place_number = parse_place_number(values[0])
-                username = normalize_username(values[2])
+                place_number = parse_place_number(place)
+                login = bare_login(user)
             except ValueError as error:
                 raise ValueError(f"CSV row {logical_row}: {error}") from error
+            position = (raw.get(headers.get(POSITION_HEADER, "")) or "bottom-left").strip().lower()
+            if position not in ("bottom-left", "bottom-right"):
+                raise ValueError(
+                    f"CSV row {logical_row}: {POSITION_HEADER} must be bottom-left or bottom-right"
+                )
             if place_number in placements:
                 raise ValueError(f"CSV row {logical_row}: duplicate placement {place_number}")
             clip = input_dir / f"{place_number}.mp4"
             if not clip.is_file():
                 raise ValueError(f"CSV row {logical_row}: missing clip {clip}")
             placements.add(place_number)
-            rows.append(
-                GameRow(logical_row, values[0], place_number, values[1], username, clip)
-            )
+            rows.append(GameRow(logical_row, place, place_number, title, f"@{login}", clip, login, position))
     if not rows:
         raise ValueError("CSV contains no game rows")
     return rows
@@ -141,16 +214,7 @@ def _positive_decimal(value: object, description: str) -> Decimal:
 
 
 def probe_media(path: Path, ffprobe: str = "ffprobe") -> MediaInfo:
-    command = [
-        ffprobe,
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        str(path),
-    ]
+    command = [ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)]
     try:
         result = subprocess.run(command, text=True, capture_output=True)
     except FileNotFoundError as error:
@@ -162,40 +226,57 @@ def probe_media(path: Path, ffprobe: str = "ffprobe") -> MediaInfo:
     except (json.JSONDecodeError, TypeError) as error:
         raise MontageError(f"probe returned malformed JSON for {path}: {error}") from error
     streams = data.get("streams", [])
-    video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
     if video is None:
         raise MontageError(f"no video stream in {path}")
-    audio = any(stream.get("codec_type") == "audio" for stream in streams)
-    duration_value = video.get("duration") or data.get("format", {}).get("duration")
-    duration = _positive_decimal(duration_value, f"duration for {path}")
+    duration = _positive_decimal(
+        video.get("duration") or data.get("format", {}).get("duration"), f"duration for {path}"
+    )
     rate_value = video.get("avg_frame_rate") or video.get("r_frame_rate")
     try:
         rate = Fraction(rate_value) if rate_value and rate_value != "0/0" else None
     except (ValueError, ZeroDivisionError):
         rate = None
     return MediaInfo(
-        path=path,
-        duration=duration,
-        has_video=True,
-        has_audio=audio,
-        width=video.get("width"),
-        height=video.get("height"),
-        frame_rate=rate,
+        path, duration, True, audio is not None, video.get("width"), video.get("height"), rate,
+        int(video["nb_frames"]) if str(video.get("nb_frames", "")).isdigit() else None,
+        int(audio["sample_rate"]) if audio and str(audio.get("sample_rate", "")).isdigit() else None,
+        int(audio["channels"]) if audio and audio.get("channels") is not None else None,
+        video.get("codec_name"), audio.get("codec_name") if audio else None,
     )
 
 
-def calculate_transition_offsets(
-    durations: Sequence[Decimal], transition: Decimal
-) -> list[Decimal]:
+def calculate_transition_offsets(durations: Sequence[Decimal], transition: Decimal) -> list[Decimal]:
     if transition <= 0:
         raise ValueError("transition duration must be positive")
     for left, right in zip(durations, durations[1:]):
         if transition >= left or transition >= right:
             raise ValueError("transition duration must be shorter than every adjacent clip")
-    return [
-        sum(durations[:index], Decimal(0)) - transition * index
-        for index in range(1, len(durations))
-    ]
+    return [sum(durations[:i], Decimal(0)) - transition * i for i in range(1, len(durations))]
+
+
+def calculate_cycle_timing(
+    frame_counts: Sequence[int], fps: int, requested_transition: Decimal, requested_seam: Decimal
+) -> CycleTiming:
+    if not frame_counts:
+        raise ValueError("at least one clip is required")
+    if fps <= 0 or SAMPLE_RATE % fps:
+        raise ValueError("fps must be positive and divide 48000 for sample-accurate looping")
+    transition_frames = int((requested_transition * fps).to_integral_value(rounding=ROUND_HALF_UP))
+    seam_frame = int((requested_seam * fps).to_integral_value(rounding=ROUND_HALF_UP))
+    if transition_frames <= 0:
+        raise ValueError("transition rounds to zero frames")
+    if any(n <= 2 * transition_frames for n in frame_counts):
+        raise ValueError("every clip must be longer than twice the frame-aligned transition")
+    entrance_end = transition_frames + int((Decimal("0.25") * fps).to_integral_value(rounding=ROUND_HALF_UP))
+    if seam_frame < entrance_end or seam_frame >= frame_counts[0] - transition_frames:
+        raise ValueError("loop seam must be after the first lower-third entrance and before its exit/transition")
+    cycle_frames = sum(frame_counts) - len(frame_counts) * transition_frames
+    return CycleTiming(
+        tuple(frame_counts), transition_frames, Decimal(transition_frames) / fps,
+        seam_frame, cycle_frames, SAMPLE_RATE // fps,
+    )
 
 
 def decimal_text(value: Decimal) -> str:
@@ -204,7 +285,7 @@ def decimal_text(value: Decimal) -> str:
 
 def run_command(argv: Sequence[str], stage: str, verbose: bool = False) -> None:
     if verbose:
-        print(f"[{stage}] {' '.join(argv)}", file=sys.stderr)
+        print(f"[{stage}] {' '.join(str(x) for x in argv)}", file=sys.stderr)
     try:
         result = subprocess.run(list(argv), text=True, capture_output=not verbose)
     except FileNotFoundError as error:
@@ -212,243 +293,390 @@ def run_command(argv: Sequence[str], stage: str, verbose: bool = False) -> None:
     if result.returncode:
         stderr = "" if verbose else (result.stderr or "")
         tail = "\n".join(stderr.strip().splitlines()[-20:])
-        raise MontageError(
-            f"{stage} failed with exit code {result.returncode}"
-            + (f":\n{tail}" if tail else "")
+        raise MontageError(f"{stage} failed with exit code {result.returncode}" + (f":\n{tail}" if tail else ""))
+
+
+def avatar_cache_path(login: str, cache_dir: Path) -> Path:
+    safe = bare_login(login).lower()
+    digest = hashlib.sha256(safe.encode()).hexdigest()[:10]
+    return cache_dir / f"{safe}-{digest}.png"
+
+
+def _valid_image(data: bytes) -> None:
+    if not data:
+        raise ValueError("avatar response is empty")
+    if len(data) > 8 * 1024 * 1024:
+        raise ValueError("avatar response exceeds 8 MiB")
+    with Image.open(io.BytesIO(data)) as image:
+        image.verify()
+    with Image.open(io.BytesIO(data)) as image:
+        if image.width < 1 or image.height < 1 or image.width > 8192 or image.height > 8192:
+            raise ValueError("avatar dimensions are unsafe")
+        image.convert("RGBA").load()
+
+
+def fetch_avatar(login: str, config: MontageConfig) -> Path | None:
+    login = bare_login(login)
+    target = avatar_cache_path(login, config.cache_path)
+    cached: Path | None = None
+    if target.is_file():
+        try:
+            _valid_image(target.read_bytes())
+            cached = target
+            if not config.refresh_avatars:
+                return cached
+        except (OSError, ValueError, UnidentifiedImageError) as error:
+            if config.offline:
+                warnings.warn(
+                    f"cached avatar for @{login} is invalid ({error}) and offline mode "
+                    "prevents recovery; using initials fallback"
+                )
+                return None
+            warnings.warn(f"cached avatar for @{login} is invalid ({error}); downloading a replacement")
+    if config.offline:
+        if cached is not None:
+            return cached
+        warnings.warn(f"avatar for @{login} is not cached and offline mode is enabled; using fallback")
+        return None
+    url = f"https://github.com/{login}.png?size=256"
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "js13k-montage/1.0 (+https://github.com/)",
+                "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8",
+            },
         )
+        with urllib.request.urlopen(request, timeout=config.avatar_timeout) as response:
+            content_type = response.headers.get_content_type()
+            if not content_type.startswith("image/"):
+                raise ValueError(f"unexpected content type {content_type}")
+            data = response.read(8 * 1024 * 1024 + 1)
+        _valid_image(data)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f".{target.name}.", suffix=".partial",
+                dir=target.parent, delete=False,
+            ) as handle:
+                staging = Path(handle.name)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _valid_image(staging.read_bytes())
+            os.replace(staging, target)
+        finally:
+            if staging is not None:
+                staging.unlink(missing_ok=True)
+        return target
+    except Exception as error:
+        detail = (
+            f"HTTP {error.code} {error.reason}"
+            if isinstance(error, urllib.error.HTTPError)
+            else f"{type(error).__name__}: {error}"
+        )
+        fallback = "using cached avatar" if cached is not None else "using initials fallback"
+        warnings.warn(f"avatar download for @{login} failed ({detail}); {fallback}")
+        return cached
 
 
-def write_lower_third_svg(row: GameRow, config: MontageConfig, output: Path) -> None:
+def fallback_initials(login: str) -> str:
+    parts = [part for part in re.split(r"[-_.]+", bare_login(login)) if part]
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[-1][0]).upper()
+    capitals = [c for c in parts[0][1:] if c.isupper()] if parts else []
+    return ((parts[0][0] + capitals[0]) if parts and capitals else (parts[0][:2] if parts else "?")).upper()
+
+
+def _center_crop(image: Image.Image, size: int) -> Image.Image:
+    image = image.convert("RGBA")
+    side = min(image.size)
+    left = (image.width - side) // 2
+    top = (image.height - side) // 2
+    return image.crop((left, top, left + side, top + side)).resize((size, size), Image.Resampling.LANCZOS)
+
+
+def load_avatar_or_fallback(row: GameRow, config: MontageConfig, size: int) -> Image.Image:
+    login = row.github_login or bare_login(row.username)
+    path = fetch_avatar(login, config)
+    canvas = Image.new("RGBA", (size, size))
+    mask = Image.new("L", (size, size))
+    ImageDraw.Draw(mask).ellipse((1, 1, size - 2, size - 2), fill=255)
+    if path:
+        try:
+            with Image.open(path) as source:
+                avatar = _center_crop(source, size)
+            canvas.paste(avatar, (0, 0), mask)
+        except (OSError, UnidentifiedImageError) as error:
+            warnings.warn(f"could not decode cached avatar for @{login}: {error}; using initials fallback")
+            path = None
+    if not path:
+        draw = ImageDraw.Draw(canvas)
+        draw.ellipse((1, 1, size - 2, size - 2), fill=(31, 42, 48, 255))
+        font = ImageFont.truetype(str(config.font_bold_path or config.font_path), max(12, round(size * .36)))
+        text = fallback_initials(login)
+        box = draw.textbbox((0, 0), text, font=font)
+        draw.text(((size - (box[2] - box[0])) / 2, (size - (box[3] - box[1])) / 2 - box[1]),
+                  text, font=font, fill=(126, 231, 135, 255))
+    ImageDraw.Draw(canvas).ellipse((1, 1, size - 2, size - 2), outline=(255, 255, 255, 100), width=max(1, size // 48))
+    canvas.putalpha(Image.composite(canvas.getchannel("A"), Image.new("L", (size, size)), mask))
+    return canvas
+
+
+def _load_octocat(config: MontageConfig, size: int) -> Image.Image:
+    path = config.octocat_path
+    if path.suffix.lower() == ".svg":
+        result = subprocess.run(
+            ["rsvg-convert", "-w", str(size), "-h", str(size), str(path)],
+            capture_output=True,
+        )
+        if result.returncode:
+            raise MontageError(f"could not render Octocat SVG {path}: {result.stderr.decode(errors='replace')}")
+        source = Image.open(io.BytesIO(result.stdout))
+    else:
+        source = Image.open(path)
+    with source:
+        return source.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+
+
+def _fit_title(draw: ImageDraw.ImageDraw, title: str, font_path: Path, max_width: int, max_height: int,
+               start_size: int, minimum: int) -> tuple[ImageFont.FreeTypeFont, tuple[str, ...]]:
+    words = title.split()
+    for size in range(start_size, minimum - 1, -1):
+        font = ImageFont.truetype(str(font_path), size)
+        if draw.textbbox((0, 0), title, font=font)[2] <= max_width:
+            return font, (title,)
+        for cut in range(1, len(words)):
+            lines = (" ".join(words[:cut]), " ".join(words[cut:]))
+            widths = [draw.textbbox((0, 0), line, font=font)[2] for line in lines]
+            line_height = draw.textbbox((0, 0), "Ag", font=font)[3]
+            if max(widths) <= max_width and line_height * 2 + round(size * .12) <= max_height:
+                return font, lines
+    raise MontageError(f"game title cannot fit in lower third: {title!r}")
+
+
+def render_lower_third(
+    row: GameRow, avatar: Image.Image, config: MontageConfig, output_png: Path
+) -> LowerThirdLayout:
     scale = config.height / 1080
-    margin = max(18, round(64 * scale))
-    box_width = min(config.width - 2 * margin, max(round(820 * scale), config.width // 2))
-    box_height = max(88, round(150 * scale))
-    box_y = config.height - margin - box_height
-    radius = max(10, round(18 * scale))
-    logo_size = max(40, round(78 * scale))
-    logo_x = margin + max(10, round(22 * scale))
-    logo_y = box_y + (box_height - logo_size) // 2
-    text_x = logo_x + logo_size + max(12, round(24 * scale))
-    title_y = box_y + max(36, round(56 * scale))
-    detail_y = box_y + max(70, round(105 * scale))
-    title_size = max(20, round(42 * scale))
-    detail_size = max(14, round(26 * scale))
-    detail = f"{row.username}  •  {row.place} Place"
-    def embedded_uri(path: Path, fallback_type: str) -> str:
-        media_type = mimetypes.guess_type(path.name)[0] or fallback_type
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return f"data:{media_type};base64,{encoded}"
-
-    # Embedding avoids librsvg's deliberate same-directory restriction on
-    # external resources and guarantees the configured font is really used.
-    font_uri = embedded_uri(config.font_path, "application/octet-stream")
-    logo_uri = embedded_uri(config.octocat_path, "application/octet-stream")
-    title = escape(row.title)
-    detail_text = escape(detail)
-    output.write_text(
-        f"""<svg xmlns="http://www.w3.org/2000/svg" width="{config.width}" height="{config.height}">
-<style>@font-face{{font-family:MontageFont;src:url('{font_uri}')}}</style>
-<rect x="{margin}" y="{box_y}" width="{box_width}" height="{box_height}" rx="{radius}" fill="#090b10" fill-opacity=".78"/>
-<image href="{logo_uri}" x="{logo_x}" y="{logo_y}" width="{logo_size}" height="{logo_size}" preserveAspectRatio="xMidYMid meet"/>
-<text x="{text_x}" y="{title_y}" font-family="MontageFont" font-size="{title_size}" font-weight="bold" fill="white">{title}</text>
-<text x="{text_x}" y="{detail_y}" font-family="MontageFont" font-size="{detail_size}" fill="#e6edf3">{detail_text}</text>
-</svg>
-""",
-        encoding="utf-8",
+    width = min(round(750 * scale), config.width - 2 * max(18, round(60 * scale)))
+    height = min(round(150 * scale), int(config.height * .15))
+    width, height = max(width, 250), max(height, 50)
+    margin = max(18, round(60 * scale))
+    x = margin if row.position == "bottom-left" else config.width - margin - width
+    y = config.height - margin - height
+    shadow_pad = max(4, round(10 * scale))
+    canvas = Image.new("RGBA", (width + 2 * shadow_pad, height + 2 * shadow_pad))
+    panel = Image.new("RGBA", canvas.size)
+    draw = ImageDraw.Draw(panel)
+    radius = max(6, round(16 * scale))
+    bounds = (shadow_pad, shadow_pad, shadow_pad + width - 1, shadow_pad + height - 1)
+    draw.rounded_rectangle(bounds, radius, fill=(13, 17, 23, 218), outline=(255, 255, 255, 32), width=1)
+    # Multiply the rounded panel's existing alpha so the fade cannot create
+    # pixels in the transparent shadow padding or rounded corner cutouts.
+    alpha = panel.getchannel("A")
+    fade = Image.new("L", canvas.size, 255)
+    fade_draw = ImageDraw.Draw(fade)
+    panel_left, panel_top, panel_right, panel_bottom = bounds
+    fade_start = panel_left + round(width * .88)
+    fade_span = max(1, panel_right - fade_start)
+    for px in range(fade_start, panel_right + 1):
+        factor = round(255 * (panel_right - px) / fade_span)
+        fade_draw.line((px, panel_top, px, panel_bottom), fill=factor)
+    panel.putalpha(ImageChops.multiply(alpha, fade))
+    shadow = panel.getchannel("A").filter(ImageFilter.GaussianBlur(max(2, round(8 * scale))))
+    canvas.paste((0, 0, 0, 110), (0, max(1, round(3 * scale))), shadow)
+    canvas.alpha_composite(panel)
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle((shadow_pad, shadow_pad + radius // 2, shadow_pad + max(3, round(4 * scale)),
+                            shadow_pad + height - radius // 2), 2, fill=(126, 231, 135, 255))
+    avatar_size = max(24, round(64 * scale))
+    av_x, av_y = shadow_pad + round(24 * scale), shadow_pad + (height - avatar_size) // 2
+    canvas.alpha_composite(avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS), (av_x, av_y))
+    text_x = av_x + avatar_size + round(22 * scale)
+    right_pad = round(24 * scale)
+    text_width = shadow_pad + width - right_pad - text_x
+    bold_path = config.font_bold_path or config.font_path
+    regular_size = max(10, round(25 * scale))
+    regular = ImageFont.truetype(str(config.font_path), regular_size)
+    title_font, lines = _fit_title(
+        draw, row.title, bold_path, text_width, max(22, round(70 * scale)),
+        max(15, round(46 * scale)), max(8, round(24 * scale)),
+    )
+    title_line_h = draw.textbbox((0, 0), "Ag", font=title_font)[3]
+    title_y = shadow_pad + round(21 * scale) if len(lines) == 1 else shadow_pad + round(12 * scale)
+    for i, line in enumerate(lines):
+        draw.text((text_x, title_y + i * round(title_line_h * 1.05)), line, font=title_font, fill=(255, 255, 255, 255))
+    title_bottom = title_y + len(lines) * round(title_line_h * 1.05)
+    detail_y = max(shadow_pad + round(94 * scale), title_bottom + round(5 * scale))
+    username_box = draw.textbbox((text_x, detail_y), row.username, font=regular)
+    draw.text((text_x, detail_y), row.username, font=regular, fill=(230, 237, 243, 235))
+    octo_size = max(10, round(24 * scale))
+    octo_x = shadow_pad + width - right_pad - octo_size
+    if username_box[2] + round(14 * scale) > octo_x:
+        raise MontageError(f"username and Octocat cannot fit for {row.username}")
+    octo_y = detail_y
+    canvas.alpha_composite(_load_octocat(config, octo_size), (octo_x, octo_y))
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_png)
+    return LowerThirdLayout(
+        canvas.width, canvas.height, x - shadow_pad, y - shadow_pad, lines, title_font.size,
+        (av_x, av_y, av_x + avatar_size, av_y + avatar_size),
+        (text_x, title_y, text_x + text_width, title_bottom), username_box,
+        (octo_x, octo_y, octo_x + octo_size, octo_y + octo_size),
     )
 
 
-def build_lower_third_command(
-    svg_path: Path, output: Path, renderer: str = "rsvg-convert"
-) -> list[str]:
-    return [renderer, str(svg_path), "--output", str(output)]
+def overlay_expressions(layout: LowerThirdLayout, duration: Decimal, transition: Decimal) -> tuple[str, str]:
+    enter_start = transition
+    enter_end = enter_start + Decimal("0.25")
+    exit_end = duration - transition
+    exit_start = exit_end - Decimal("0.225")
+    if exit_start <= enter_end:
+        raise MontageError("clip is too short for lower-third animation")
+    x = str(layout.x)
+    # FFmpeg's overlay expression uses t; cubic easing stays still during hold.
+    y = (
+        f"if(lt(t,{decimal_text(enter_start)}),{layout.y + 16},"
+        f"if(lt(t,{decimal_text(enter_end)}),"
+        f"{layout.y}+16*(1-(t-{decimal_text(enter_start)})/0.25)^3,"
+        f"if(lt(t,{decimal_text(exit_start)}),{layout.y},"
+        f"if(lt(t,{decimal_text(exit_end)}),{layout.y}+12*((t-{decimal_text(exit_start)})/0.225)^3,"
+        f"{layout.y + 12}))))"
+    )
+    return x, y
 
 
 def build_segment_command(
-    row: GameRow,
-    media: MediaInfo,
-    config: MontageConfig,
-    overlay_path: Path,
-    output_path: Path,
-    ffmpeg: str = "ffmpeg",
+    row: GameRow, media: MediaInfo, config: MontageConfig, overlay_path: Path,
+    output_path: Path, ffmpeg: str = "ffmpeg", layout: LowerThirdLayout | None = None,
+    timing: CycleTiming | None = None,
 ) -> list[str]:
-    width, height = config.width, config.height
+    frame_count = timing.frame_counts[0] if timing and len(timing.frame_counts) == 1 else int(
+        (media.duration * config.fps).to_integral_value(rounding=ROUND_HALF_UP)
+    )
+    duration = Decimal(frame_count) / config.fps
+    transition = timing.transition if timing else Decimal(
+        int((config.transition_duration * config.fps).to_integral_value(rounding=ROUND_HALF_UP))
+    ) / config.fps
+    if layout is None:
+        layout = LowerThirdLayout(config.width, config.height, 0, 0, (), 0, (0, 0, 0, 0),
+                                  (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0))
+    x, y = overlay_expressions(layout, duration, transition)
+    enter = transition
+    exit_start = duration - transition - Decimal("0.225")
     video_filter = (
         f"[0:v]split=2[bg0][fg0];"
-        f"[bg0]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},gblur=sigma=18,eq=brightness=-0.18[bg];"
-        f"[fg0]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg0]scale={config.width}:{config.height}:force_original_aspect_ratio=increase,"
+        f"crop={config.width}:{config.height},gblur=sigma=18,eq=brightness=-0.18[bg];"
+        f"[fg0]scale={config.width}:{config.height}:force_original_aspect_ratio=decrease[fg];"
         f"[bg][fg]overlay=(W-w)/2:(H-h)/2[game];"
-        f"[game][1:v]overlay=0:0:format=auto,fps={config.fps},setsar=1,"
-        "format=yuv420p,setpts=PTS-STARTPTS[v]"
+        f"[1:v]format=rgba,trim=duration={decimal_text(duration)},"
+        f"fade=t=in:st={decimal_text(enter)}:d=0.25:alpha=1,"
+        f"fade=t=out:st={decimal_text(exit_start)}:d=0.225:alpha=1[panel];"
+        f"[game][panel]overlay=x='{x}':y='{y}':enable='between(t,{decimal_text(enter)},{decimal_text(duration-transition)})':"
+        f"format=auto,fps={config.fps},trim=end_frame={frame_count},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v]"
     )
     audio_index = 0 if media.has_audio else 2
     loudness = "loudnorm=I=-16:TP=-1.5:LRA=11," if media.has_audio else ""
+    sample_count = frame_count * (SAMPLE_RATE // config.fps)
     audio_filter = (
-        f"[{audio_index}:a]asetpts=PTS-STARTPTS,"
-        "aresample=48000:async=1:first_pts=0,"
-        "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-        f"{loudness}"
-        f"apad,atrim=duration={decimal_text(media.duration)}[a]"
+        f"[{audio_index}:a]asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,"
+        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,{loudness}"
+        "aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+        f"apad,atrim=end_sample={sample_count}[a]"
     )
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-y",
-        "-i",
-        str(row.clip_path),
-        "-loop",
-        "1",
-        "-i",
-        str(overlay_path),
-    ]
+    command = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(row.clip_path),
+               "-loop", "1", "-framerate", str(config.fps), "-i", str(overlay_path)]
     if not media.has_audio:
         command.extend(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
-    command.extend(
-        [
-            "-filter_complex",
-            f"{video_filter};{audio_filter}",
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
-            "-t",
-            decimal_text(media.duration),
-            "-c:v",
-            "libx264",
-            "-preset",
-            config.preset,
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-r",
-            str(config.fps),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            str(output_path),
-        ]
-    )
+    command.extend([
+        "-filter_complex", f"{video_filter};{audio_filter}", "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", config.preset, "-crf", "18", "-pix_fmt", "yuv420p",
+        "-r", str(config.fps), "-c:a", "pcm_s16le", str(output_path),
+    ])
     return command
 
 
 def build_combine_command(
-    segments: Sequence[Path],
-    durations: Sequence[Decimal],
-    config: MontageConfig,
-    filter_path: Path,
-    staging_path: Path,
-    ffmpeg: str = "ffmpeg",
+    segments: Sequence[Path], durations: Sequence[Decimal], config: MontageConfig,
+    filter_path: Path, staging_path: Path, ffmpeg: str = "ffmpeg",
+    timing: CycleTiming | None = None,
 ) -> list[str]:
-    # Keep complex-filter output deterministic across FFmpeg thread schedulers.
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-filter_complex_threads",
-        "1",
-        "-y",
-    ]
-    for segment in segments:
+    if timing is None:
+        counts = [int((d * config.fps).to_integral_value(rounding=ROUND_HALF_UP)) for d in durations]
+        timing = calculate_cycle_timing(counts, config.fps, config.transition_duration, config.loop_seam)
+    command = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-filter_complex_threads", "1", "-y"]
+    cyclic = list(segments) + [segments[0]]
+    for segment in cyclic:
         command.extend(["-i", str(segment)])
     graph: list[str] = []
-    if len(segments) == 1:
-        video_map, audio_map = "0:v:0", "0:a:0"
-    else:
-        offsets = calculate_transition_offsets(durations, config.transition_duration)
-        video_input = "[0:v]"
-        for index, offset in enumerate(offsets, start=1):
-            video_label = "vout" if index == len(segments) - 1 else f"v{index}"
-            graph.append(
-                f"{video_input}[{index}:v]xfade=transition=fade"
-                f":duration={decimal_text(config.transition_duration)}"
-                f":offset={decimal_text(offset)}[{video_label}]"
-            )
-            video_input = f"[{video_label}]"
-        audio_input = "[0:a]"
-        for index in range(1, len(segments)):
-            audio_label = f"a{index}"
-            graph.append(
-                f"{audio_input}[{index}:a]acrossfade=d={decimal_text(config.transition_duration)}"
-                f":c1=tri:c2=tri[{audio_label}]"
-            )
-            audio_input = f"[{audio_label}]"
-        video_map, audio_map = "[vout]", audio_input
-        filter_path.write_text(";\n".join(graph), encoding="utf-8")
-        command.extend(["-filter_complex_script", str(filter_path)])
-    command.extend(
-        [
-            "-map",
-            video_map,
-            "-map",
-            audio_map,
-            "-c:v",
-            "libx264",
-            "-preset",
-            config.preset,
-            "-crf",
-            str(config.crf),
-            "-pix_fmt",
-            "yuv420p",
-            "-r",
-            str(config.fps),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
-            str(staging_path),
-        ]
-    )
+    video_input, audio_input = "[0:v]", "[0:a]"
+    cumulative = timing.frame_counts[0]
+    for index in range(1, len(cyclic)):
+        offset_frames = cumulative - index * timing.transition_frames
+        offset = Decimal(offset_frames) / config.fps
+        vlabel, alabel = f"vx{index}", f"ax{index}"
+        graph.append(
+            f"{video_input}[{index}:v]xfade=transition=fade:duration={decimal_text(timing.transition)}:"
+            f"offset={decimal_text(offset)}[{vlabel}]"
+        )
+        graph.append(
+            f"{audio_input}[{index}:a]acrossfade=nb_samples={timing.transition_frames * timing.samples_per_frame}:"
+            f"c1=tri:c2=tri[{alabel}]"
+        )
+        video_input, audio_input = f"[{vlabel}]", f"[{alabel}]"
+        if index < len(timing.frame_counts):
+            cumulative += timing.frame_counts[index]
+    end_frame = timing.seam_frame + timing.cycle_frames
+    start_sample = timing.seam_frame * timing.samples_per_frame
+    end_sample = start_sample + timing.cycle_samples
+    graph.extend([
+        f"{video_input}trim=start_frame={timing.seam_frame}:end_frame={end_frame},setpts=PTS-STARTPTS[vout]",
+        f"{audio_input}atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS[aout]",
+    ])
+    filter_path.write_text(";\n".join(graph), encoding="utf-8")
+    command.extend([
+        "-filter_complex_script", str(filter_path), "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", config.preset, "-crf", str(config.crf), "-pix_fmt", "yuv420p",
+        "-r", str(config.fps), "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart", str(staging_path),
+    ])
     return command
 
 
 def validate_inputs(config: MontageConfig, rows: Sequence[GameRow]) -> None:
     if config.width <= 0 or config.height <= 0 or config.width % 2 or config.height % 2:
         raise MontageError("output width and height must be positive even integers")
-    if config.fps <= 0:
-        raise MontageError("fps must be positive")
+    if config.fps <= 0 or SAMPLE_RATE % config.fps:
+        raise MontageError("fps must be positive and divide 48000")
     if not config.octocat_path.is_file():
         raise MontageError(f"Octocat image is missing or not a file: {config.octocat_path}")
-    if not config.font_path.is_file():
-        raise MontageError(f"font is missing or not a file: {config.font_path}")
-    if config.output_path.exists() and not config.force:
-        raise MontageError(f"output already exists (use --force): {config.output_path}")
+    for label, path in (("font", config.font_path), ("bold font", config.font_bold_path or config.font_path)):
+        if not path.is_file():
+            raise MontageError(f"{label} is missing or not a file: {path}; supply a Mona Sans TTF/OTF")
+    outputs = (config.output_path, config.preview_path, config.contact_sheet_path, config.loop_test_path)
+    existing = [str(path) for path in outputs if path.exists()]
+    if existing and not config.force:
+        raise MontageError(f"output artifact(s) already exist (use --force): {', '.join(existing)}")
     output = config.output_path.resolve()
     if any(output == row.clip_path.resolve() for row in rows):
         raise MontageError("output path must not overwrite an input clip")
-    for dependency in ("ffmpeg", "ffprobe", "rsvg-convert"):
+    dependencies = ["ffmpeg", "ffprobe"] + (["rsvg-convert"] if config.octocat_path.suffix.lower() == ".svg" else [])
+    for dependency in dependencies:
         if shutil.which(dependency) is None:
             raise MontageError(f"required dependency not found on PATH: {dependency}")
-    capability_checks = (
+    checks = (
         (["ffmpeg", "-hide_banner", "-filters"], ("overlay", "xfade", "acrossfade"), "filters"),
         (["ffmpeg", "-hide_banner", "-encoders"], ("libx264", "aac"), "encoders"),
     )
-    for command, required, description in capability_checks:
+    for command, required, description in checks:
         result = subprocess.run(command, text=True, capture_output=True)
         available = result.stdout + result.stderr
         missing = [name for name in required if name not in available]
         if result.returncode or missing:
-            raise MontageError(
-                f"FFmpeg is missing required {description}: {', '.join(missing) or 'unable to inspect'}"
-            )
-    calculate_transition_offsets(
-        [probe_media(row.clip_path).duration for row in rows], config.transition_duration
-    )
+            raise MontageError(f"FFmpeg is missing required {description}: {', '.join(missing) or 'unable to inspect'}")
 
 
 def verify_render(path: Path, config: MontageConfig, stage: str) -> MediaInfo:
@@ -456,27 +684,76 @@ def verify_render(path: Path, config: MontageConfig, stage: str) -> MediaInfo:
     if not info.has_audio:
         raise MontageError(f"{stage}: rendered file has no audio stream: {path}")
     if (info.width, info.height) != (config.width, config.height):
-        raise MontageError(
-            f"{stage}: expected {config.width}x{config.height}, got {info.width}x{info.height}"
-        )
-    if info.frame_rate is None or abs(float(info.frame_rate) - config.fps) > 0.01:
+        raise MontageError(f"{stage}: expected {config.width}x{config.height}, got {info.width}x{info.height}")
+    if info.frame_rate is None or abs(float(info.frame_rate) - config.fps) > .01:
         raise MontageError(f"{stage}: expected {config.fps} fps, got {info.frame_rate}")
     return info
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Build a normalized gameplay montage in CSV row order."
+def _extract_frame(video: Path, time: Decimal, output: Path, ffmpeg: str = "ffmpeg") -> None:
+    run_command([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", decimal_text(time),
+                 "-i", str(video), "-frames:v", "1", str(output)], f"frame extraction from {video.name}")
+
+
+def _create_contact_sheet(frames: Sequence[Path], output: Path) -> None:
+    with Image.open(frames[0]) as first:
+        cell_w, cell_h = first.size
+    thumb_w, thumb_h = 480, round(480 * cell_h / cell_w)
+    gap = 12
+    sheet = Image.new("RGB", (4 * thumb_w + 5 * gap, 4 * thumb_h + 5 * gap), (13, 17, 23))
+    for index, frame in enumerate(frames):
+        with Image.open(frame) as image:
+            thumb = image.convert("RGB").resize((thumb_w, thumb_h), Image.Resampling.LANCZOS)
+        x = gap + (index % 4) * (thumb_w + gap)
+        y = gap + (index // 4) * (thumb_h + gap)
+        sheet.paste(thumb, (x, y))
+    sheet.save(output, quality=92, optimize=True)
+
+
+def _build_loop_test(source: Path, output: Path, config: MontageConfig, duration: Decimal) -> None:
+    span = min(Decimal("2"), duration / 4)
+    start = duration - span
+    graph = (
+        f"[0:v]trim=start={decimal_text(start)}:end={decimal_text(duration)},setpts=PTS-STARTPTS[v0];"
+        f"[0:a]atrim=start={decimal_text(start)}:end={decimal_text(duration)},asetpts=PTS-STARTPTS[a0];"
+        f"[0:v]trim=start=0:end={decimal_text(span)},setpts=PTS-STARTPTS[v1];"
+        f"[0:a]atrim=start=0:end={decimal_text(span)},asetpts=PTS-STARTPTS[a1];"
+        "[v0][v1]concat=n=2:v=1:a=0[v];[a0][a1]concat=n=2:v=0:a=1[a]"
     )
+    run_command([
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-i", str(source),
+        "-filter_complex", graph, "-map", "[v]", "-map", "[a]", "-c:v", "libx264",
+        "-preset", config.preset, "-crf", str(config.crf), "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", str(output),
+    ], "loop-test render", config.verbose)
+
+
+def _default_font(name: str) -> Path | None:
+    candidates = [
+        Path("assets") / name,
+        Path("/Library/Fonts") / name,
+        Path.home() / "Library/Fonts" / name,
+    ]
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Build a normalized, seamlessly cyclic gameplay montage in CSV order.")
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("csv_file", type=Path)
     parser.add_argument("output_file", type=Path)
     parser.add_argument("--octocat", type=Path, default=os.environ.get("OCTOCAT_PATH"))
     parser.add_argument("--font", type=Path, default=os.environ.get("FONT_PATH"))
+    parser.add_argument("--font-bold", type=Path, default=os.environ.get("FONT_BOLD_PATH"))
+    parser.add_argument("--avatar-cache", type=Path)
+    parser.add_argument("--avatar-timeout", type=float, default=8)
+    parser.add_argument("--refresh-avatars", action="store_true")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--loop-seam", type=Decimal, default=Decimal("1.5"))
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--transition-duration", type=Decimal, default=Decimal("0.75"))
+    parser.add_argument("--transition-duration", type=Decimal, default=Decimal("0.65"))
     parser.add_argument("--crf", type=int, default=20)
     parser.add_argument("--preset", default="medium")
     parser.add_argument("--keep-temp", action="store_true")
@@ -486,32 +763,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> MontageConfig:
-    if args.octocat is None or args.font is None:
-        parser.error(
-            "--octocat and --font are required (or set OCTOCAT_PATH and FONT_PATH); "
-            "example: --octocat assets/logo.png --font /path/to/font.ttf"
-        )
+    octocat = args.octocat or Path("assets/GitHub_Invertocat_White.svg")
+    font = args.font or _default_font("MonaSans-Regular.ttf")
+    bold = args.font_bold or _default_font("MonaSans-Bold.ttf")
+    if font is None or bold is None:
+        parser.error("Mona Sans is required; use --font and --font-bold (or FONT_PATH/FONT_BOLD_PATH)")
     if not args.input_dir.is_dir():
         parser.error(f"input directory does not exist: {args.input_dir}")
     if not args.csv_file.is_file():
         parser.error(f"CSV file does not exist: {args.csv_file}")
-    if args.transition_duration <= 0:
-        parser.error("--transition-duration must be positive")
+    if args.transition_duration <= 0 or args.loop_seam <= 0:
+        parser.error("--transition-duration and --loop-seam must be positive")
+    if args.avatar_timeout <= 0:
+        parser.error("--avatar-timeout must be positive")
     return MontageConfig(
-        args.input_dir,
-        args.csv_file,
-        args.output_file,
-        args.octocat,
-        args.font,
-        args.width,
-        args.height,
-        args.fps,
-        args.transition_duration,
-        args.keep_temp,
-        args.force,
-        args.crf,
-        args.preset,
-        args.verbose,
+        args.input_dir, args.csv_file, args.output_file, octocat, font, args.width, args.height,
+        args.fps, args.transition_duration, args.keep_temp, args.force, args.crf, args.preset,
+        args.verbose, args.avatar_cache, args.avatar_timeout, args.refresh_avatars, args.offline,
+        args.loop_seam, bold,
     )
 
 
@@ -519,48 +788,69 @@ def create_montage(config: MontageConfig) -> None:
     rows = parse_csv(config.csv_path, config.input_dir)
     media = [probe_media(row.clip_path) for row in rows]
     validate_inputs(config, rows)
-    calculate_transition_offsets([item.duration for item in media], config.transition_duration)
-    config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    work_dir = Path(
-        tempfile.mkdtemp(prefix=".montage-work-", dir=str(config.output_path.parent))
+    avatar_results = [(row.github_login, fetch_avatar(row.github_login, config)) for row in rows]
+    available = [login for login, path in avatar_results if path is not None]
+    unavailable = [login for login, path in avatar_results if path is None]
+    print(
+        f"Avatars: verified {len(available)}/{len(rows)} real decoded cached images",
+        file=sys.stderr,
     )
-    staging = config.output_path.parent / f".{config.output_path.name}.partial.mp4"
+    if unavailable:
+        print(
+            "Avatars unavailable (initials fallback): "
+            + ", ".join(f"@{login}" for login in unavailable),
+            file=sys.stderr,
+        )
+    frame_counts = [
+        int((item.duration * config.fps).to_integral_value(rounding=ROUND_HALF_UP)) for item in media
+    ]
+    timing = calculate_cycle_timing(frame_counts, config.fps, config.transition_duration, config.loop_seam)
+    if timing.transition != config.transition_duration:
+        print(f"Transition quantized to {timing.transition_frames} frames ({timing.transition}s)", file=sys.stderr)
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix=".montage-work-", dir=str(config.output_path.parent)))
+    staging = {
+        config.output_path: work_dir / "output.mp4",
+        config.preview_path: work_dir / "lower-third-preview.png",
+        config.contact_sheet_path: work_dir / "montage-contact-sheet.jpg",
+        config.loop_test_path: work_dir / "loop-test.mp4",
+    }
     try:
         segments: list[Path] = []
-        for index, (row, info) in enumerate(zip(rows, media), start=1):
-            overlay_svg = work_dir / f"segment-{index:03d}-lower-third.svg"
+        contact_frames: list[Path] = []
+        for index, (row, info, frames) in enumerate(zip(rows, media, frame_counts), start=1):
             overlay = work_dir / f"segment-{index:03d}-lower-third.png"
-            segment = work_dir / f"segment-{index:03d}.mp4"
-            write_lower_third_svg(row, config, overlay_svg)
-            run_command(
-                build_lower_third_command(overlay_svg, overlay),
-                f"lower-third render for CSV row {row.row_number}",
-                config.verbose,
-            )
-            run_command(
-                build_segment_command(row, info, config, overlay, segment),
-                f"segment render for {row.clip_path}",
-                config.verbose,
-            )
+            segment = work_dir / f"segment-{index:03d}.mkv"
+            avatar = load_avatar_or_fallback(row, config, max(24, round(64 * config.height / 1080)))
+            layout = render_lower_third(row, avatar, config, overlay)
+            one_timing = CycleTiming((frames,), timing.transition_frames, timing.transition,
+                                     timing.seam_frame, frames - timing.transition_frames,
+                                     timing.samples_per_frame)
+            run_command(build_segment_command(row, info, config, overlay, segment, layout=layout, timing=one_timing),
+                        f"segment render for {row.clip_path}", config.verbose)
             verify_render(segment, config, "segment validation")
             segments.append(segment)
-        filter_path = work_dir / "combine-filter.txt"
-        run_command(
-            build_combine_command(
-                segments,
-                [item.duration for item in media],
-                config,
-                filter_path,
-                staging,
-            ),
-            "montage combine",
-            config.verbose,
-        )
-        verify_render(staging, config, "final validation")
-        os.replace(staging, config.output_path)
+            frame = work_dir / f"contact-{index:03d}.png"
+            stable_frame = Decimal(max(timing.seam_frame, timing.transition_frames + round(.4 * config.fps))) / config.fps
+            _extract_frame(segment, stable_frame, frame)
+            contact_frames.append(frame)
+        filter_path = work_dir / "cyclic-filter.txt"
+        run_command(build_combine_command(segments, [Decimal(n) / config.fps for n in frame_counts],
+                                          config, filter_path, staging[config.output_path], timing=timing),
+                    "cyclic montage combine", config.verbose)
+        final_info = verify_render(staging[config.output_path], config, "final validation")
+        shutil.copyfile(contact_frames[0], staging[config.preview_path])
+        _create_contact_sheet(contact_frames, staging[config.contact_sheet_path])
+        _build_loop_test(staging[config.output_path], staging[config.loop_test_path], config, final_info.duration)
+        verify_render(staging[config.loop_test_path], config, "loop-test validation")
+        with Image.open(staging[config.preview_path]) as image:
+            image.verify()
+        with Image.open(staging[config.contact_sheet_path]) as image:
+            image.verify()
+        for destination, source in staging.items():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
     finally:
-        if staging.exists():
-            staging.unlink()
         if config.keep_temp:
             print(f"Kept montage work directory: {work_dir}", file=sys.stderr)
         else:
@@ -578,7 +868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (MontageError, ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    print(f"Created montage: {config.output_path}")
+    print(f"Created montage and supporting artifacts beside: {config.output_path}")
     return 0
 
 
