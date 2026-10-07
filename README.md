@@ -10,6 +10,7 @@ thirds. The exported timeline is a true video **and audio** cycle.
 - Python 3.10+ and Pillow (`python3 -m pip install -r requirements.txt`)
 - FFmpeg/FFprobe with `libx264`, AAC, `overlay`, `xfade`, and `acrossfade`
 - Mona Sans regular and bold TTF/OTF files
+- Hubot Sans TTF/OTF and a background image for the optional Instagram variant
 - `rsvg-convert` when the configured Octocat is SVG
 
 On macOS:
@@ -38,6 +39,33 @@ Useful options:
 - `--loop-seam` (default 1.5 s into Game 1)
 - `--avatar-cache`, `--avatar-timeout`, `--refresh-avatars`, `--offline`
 - `--crf`, `--preset`, `--keep-temp`, `--force`, `--verbose`
+
+### Instagram 9:16 variant
+
+Pass `--instagram-background <image>` to additionally render a portrait
+1080×1920 montage from the same clips in the same CSV order. Gameplay is placed
+full width across the top (a 1080×608 16:9 panel with the same blurred, no-crop
+fill), and the supplied image fills the lower region behind the game title,
+place, creator, and avatar (Mona Sans). The footer shows uppercase
+`JS13KGAMES` in Hubot Sans at bottom-left and the white Invertocat bottom-right
+at the same visual height.
+
+```bash
+./make-montage.sh videos/ data.csv output.mp4 \
+  --octocat assets/GitHub_Invertocat_White.svg \
+  --font /Library/Fonts/MonaSans-Regular.ttf \
+  --font-bold /Library/Fonts/MonaSans-Bold.ttf \
+  --instagram-background assets/instagram-backdrop.png \
+  --hubot-font /Library/Fonts/HubotSans-Bold.ttf
+```
+
+The portrait file defaults to `<output>-instagram.mp4` beside the landscape
+output; override it with `--instagram-output`. `--hubot-font`
+(or `HUBOT_FONT_PATH`) is required when the variant is enabled; the background
+and `--instagram-output` also honour `INSTAGRAM_BACKGROUND` and
+`INSTAGRAM_OUTPUT`. The landscape output and all its artifacts are unchanged,
+and both files are published atomically. Omit `--instagram-background` to keep
+the original landscape-only behavior.
 
 `--force` applies to all four deliverables. Publication is atomic: existing
 deliverables are left in place if rendering fails. `--keep-temp` preserves the
@@ -105,6 +133,8 @@ Created beside the requested output:
 - `montage-contact-sheet.jpg`: 13 ordered representative gameplay frames
 - `loop-test.mp4`: decoded final ~2 seconds followed directly by first ~2
   seconds, with no added fade at its midpoint
+- `<output>-instagram.mp4` (only with `--instagram-background`): the portrait
+  1080×1920 variant in identical clip order
 
 Inspect the contact sheet for title/HUD placement and play `loop-test.mp4`
 repeatedly with audio to assess the actual wraparound.

@@ -17,7 +17,7 @@ import tempfile
 import urllib.error
 import urllib.request
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from fractions import Fraction
 from pathlib import Path
@@ -92,10 +92,26 @@ class MontageConfig:
     offline: bool = False
     loop_seam: Decimal = Decimal("1.5")
     font_bold_path: Path | None = None
+    instagram_background: Path | None = None
+    instagram_output: Path | None = None
+    hubot_font_path: Path | None = None
+    instagram_width: int = 1080
+    instagram_height: int = 1920
 
     @property
     def preview_path(self) -> Path:
         return self.output_path.parent / "lower-third-preview.png"
+
+    @property
+    def instagram_enabled(self) -> bool:
+        return self.instagram_background is not None
+
+    @property
+    def instagram_output_path(self) -> Path:
+        if self.instagram_output is not None:
+            return self.instagram_output
+        base = self.output_path
+        return base.with_name(f"{base.stem}-instagram{base.suffix}")
 
     @property
     def contact_sheet_path(self) -> Path:
@@ -122,6 +138,22 @@ class LowerThirdLayout:
     title_bounds: tuple[int, int, int, int]
     username_bounds: tuple[int, int, int, int]
     octocat_bounds: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class InstagramLayout:
+    width: int
+    height: int
+    panel_height: int
+    background_bounds: tuple[int, int, int, int]
+    place_bounds: tuple[int, int, int, int]
+    title_bounds: tuple[int, int, int, int]
+    avatar_bounds: tuple[int, int, int, int]
+    creator_bounds: tuple[int, int, int, int]
+    wordmark_bounds: tuple[int, int, int, int]
+    octocat_bounds: tuple[int, int, int, int]
+    title_lines: tuple[str, ...]
+    title_size: int
 
 
 @dataclass(frozen=True)
@@ -599,6 +631,156 @@ def build_segment_command(
     return command
 
 
+def instagram_panel_height(width: int) -> int:
+    height = int((Decimal(width) * 9 / 16).to_integral_value(rounding=ROUND_HALF_UP))
+    return height + (height % 2)
+
+
+def render_instagram_card(
+    row: GameRow, avatar: Image.Image, config: MontageConfig, output_png: Path
+) -> InstagramLayout:
+    width, height = config.width, config.height
+    panel_h = instagram_panel_height(width)
+    margin = max(24, round(width * 0.06))
+    canvas = Image.new("RGBA", (width, height), (13, 17, 23, 255))
+    # Gameplay occupies the top panel at render time; keep it dark in the card.
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, 0, width - 1, panel_h - 1), fill=(0, 0, 0, 255))
+    background_bounds = (0, panel_h, width, height)
+    try:
+        with Image.open(config.instagram_background) as source:
+            backdrop = source.convert("RGBA")
+    except (OSError, UnidentifiedImageError) as error:
+        raise MontageError(
+            f"could not decode Instagram background {config.instagram_background}: {error}"
+        ) from error
+    region_w, region_h = width, height - panel_h
+    scale = max(region_w / backdrop.width, region_h / backdrop.height)
+    resized = backdrop.resize(
+        (max(1, round(backdrop.width * scale)), max(1, round(backdrop.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    crop_left = (resized.width - region_w) // 2
+    crop_top = (resized.height - region_h) // 2
+    backdrop = resized.crop((crop_left, crop_top, crop_left + region_w, crop_top + region_h))
+    canvas.alpha_composite(backdrop, (0, panel_h))
+    # Darken the lower region slightly for text legibility over any artwork.
+    scrim = Image.new("RGBA", (region_w, region_h), (13, 17, 23, 120))
+    canvas.alpha_composite(scrim, (0, panel_h))
+    draw = ImageDraw.Draw(canvas)
+
+    bold_path = config.font_bold_path or config.font_path
+    regular_path = config.font_path
+    content_left = margin
+    content_width = width - 2 * margin
+
+    # Footer: wordmark bottom-left (Hubot Sans), white Invertocat bottom-right.
+    footer_bottom = height - margin
+    hubot_path = config.hubot_font_path or bold_path
+    wordmark_text = "JS13KGAMES"
+    foot_size = max(20, round(width * 0.044))
+    hubot_font = ImageFont.truetype(str(hubot_path), foot_size)
+    wm_box = draw.textbbox((0, 0), wordmark_text, font=hubot_font)
+    cap_height = wm_box[3] - wm_box[1]
+    wm_width = wm_box[2] - wm_box[0]
+    wm_draw_x = content_left - wm_box[0]
+    wm_draw_y = footer_bottom - wm_box[3]
+    draw.text((wm_draw_x, wm_draw_y), wordmark_text, font=hubot_font, fill=(255, 255, 255, 255))
+    wordmark_bounds = (content_left, footer_bottom - cap_height, content_left + wm_width, footer_bottom)
+    logo_size = cap_height
+    octo_x = width - margin - logo_size
+    octo_y = footer_bottom - logo_size
+    canvas.alpha_composite(_load_octocat(config, logo_size), (octo_x, octo_y))
+    octocat_bounds = (octo_x, octo_y, octo_x + logo_size, octo_y + logo_size)
+    footer_top = min(wordmark_bounds[1], octocat_bounds[1])
+
+    # Metadata (Mona Sans): place, title, avatar, creator.
+    content_top = panel_h + margin
+    place_size = max(16, round(width * 0.040))
+    place_font = ImageFont.truetype(str(bold_path), place_size)
+    place_text = f"{row.place} place"
+    place_box = draw.textbbox((content_left, content_top), place_text, font=place_font)
+    draw.text((content_left, content_top), place_text, font=place_font, fill=(126, 231, 135, 255))
+    place_bounds = (content_left, content_top, place_box[2], place_box[3])
+
+    title_top = place_bounds[3] + max(10, round(height * 0.010))
+    title_font, lines = _fit_title(
+        draw, row.title, bold_path, content_width, round(height * 0.26),
+        max(36, round(width * 0.085)), max(22, round(width * 0.050)),
+    )
+    title_line_h = draw.textbbox((0, 0), "Ag", font=title_font)[3]
+    title_y = title_top
+    for i, line in enumerate(lines):
+        draw.text((content_left, title_y + i * round(title_line_h * 1.08)), line,
+                  font=title_font, fill=(255, 255, 255, 255))
+    title_bottom = title_y + len(lines) * round(title_line_h * 1.08)
+    title_bounds = (content_left, title_top, content_left + content_width, title_bottom)
+
+    avatar_size = max(48, round(width * 0.10))
+    avatar_top = title_bottom + max(18, round(height * 0.020))
+    avatar_top = min(avatar_top, footer_top - avatar_size - margin)
+    av_x, av_y = content_left, avatar_top
+    canvas.alpha_composite(avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS), (av_x, av_y))
+    avatar_bounds = (av_x, av_y, av_x + avatar_size, av_y + avatar_size)
+
+    creator_size = max(16, round(width * 0.036))
+    creator_font = ImageFont.truetype(str(regular_path), creator_size)
+    creator_x = av_x + avatar_size + max(16, round(width * 0.022))
+    creator_box = draw.textbbox((0, 0), row.username, font=creator_font)
+    creator_h = creator_box[3] - creator_box[1]
+    creator_y = av_y + (avatar_size - creator_h) // 2 - creator_box[1]
+    draw.text((creator_x, creator_y), row.username, font=creator_font, fill=(230, 237, 243, 255))
+    creator_bounds = (creator_x, av_y + (avatar_size - creator_h) // 2,
+                      creator_x + (creator_box[2] - creator_box[0]), av_y + (avatar_size + creator_h) // 2)
+
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    canvas.convert("RGB").save(output_png)
+    return InstagramLayout(
+        width, height, panel_h, background_bounds, place_bounds, title_bounds,
+        avatar_bounds, creator_bounds, wordmark_bounds, octocat_bounds, lines, title_font.size,
+    )
+
+
+def build_instagram_segment_command(
+    row: GameRow, media: MediaInfo, config: MontageConfig, card_path: Path,
+    output_path: Path, ffmpeg: str = "ffmpeg", timing: CycleTiming | None = None,
+) -> list[str]:
+    frame_count = timing.frame_counts[0] if timing and len(timing.frame_counts) == 1 else int(
+        (media.duration * config.fps).to_integral_value(rounding=ROUND_HALF_UP)
+    )
+    duration = Decimal(frame_count) / config.fps
+    panel_h = instagram_panel_height(config.width)
+    video_filter = (
+        f"[0:v]split=2[bg0][fg0];"
+        f"[bg0]scale={config.width}:{panel_h}:force_original_aspect_ratio=increase,"
+        f"crop={config.width}:{panel_h},gblur=sigma=18,eq=brightness=-0.18[bg];"
+        f"[fg0]scale={config.width}:{panel_h}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[panel];"
+        f"[1:v]format=rgba,trim=duration={decimal_text(duration)}[card];"
+        f"[card][panel]overlay=x=0:y=0:format=auto,"
+        f"fps={config.fps},trim=end_frame={frame_count},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v]"
+    )
+    audio_index = 0 if media.has_audio else 2
+    loudness = "loudnorm=I=-16:TP=-1.5:LRA=11," if media.has_audio else ""
+    sample_count = frame_count * (SAMPLE_RATE // config.fps)
+    audio_filter = (
+        f"[{audio_index}:a]asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,"
+        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,{loudness}"
+        "aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+        f"apad,atrim=end_sample={sample_count}[a]"
+    )
+    command = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(row.clip_path),
+               "-loop", "1", "-framerate", str(config.fps), "-i", str(card_path)]
+    if not media.has_audio:
+        command.extend(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
+    command.extend([
+        "-filter_complex", f"{video_filter};{audio_filter}", "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", config.preset, "-crf", "18", "-pix_fmt", "yuv420p",
+        "-r", str(config.fps), "-c:a", "pcm_s16le", str(output_path),
+    ])
+    return command
+
+
 def build_combine_command(
     segments: Sequence[Path], durations: Sequence[Decimal], config: MontageConfig,
     filter_path: Path, staging_path: Path, ffmpeg: str = "ffmpeg",
@@ -646,6 +828,35 @@ def build_combine_command(
     return command
 
 
+def _case_insensitive_target() -> bool:
+    """Whether the target platform's default filesystem aliases paths by case."""
+    return sys.platform == "darwin" or os.name == "nt"
+
+
+def paths_collide(first: Path, second: Path) -> bool:
+    """Return True if two paths would resolve to the same destination.
+
+    Prefers a true same-file check (os.path.samefile) when both paths exist so
+    genuine aliases (hard/symbolic links, bind mounts) are caught regardless of
+    platform. For paths that may not yet exist, compares normalized resolved
+    paths and additionally folds case on platforms whose default filesystem is
+    case-insensitive (Darwin, Windows), where a case-only difference still
+    aliases the same file.
+    """
+    try:
+        if os.path.samefile(first, second):
+            return True
+    except OSError:
+        pass
+    first_resolved = os.fspath(first.resolve())
+    second_resolved = os.fspath(second.resolve())
+    if first_resolved == second_resolved:
+        return True
+    if _case_insensitive_target():
+        return first_resolved.casefold() == second_resolved.casefold()
+    return False
+
+
 def validate_inputs(config: MontageConfig, rows: Sequence[GameRow]) -> None:
     if config.width <= 0 or config.height <= 0 or config.width % 2 or config.height % 2:
         raise MontageError("output width and height must be positive even integers")
@@ -660,9 +871,38 @@ def validate_inputs(config: MontageConfig, rows: Sequence[GameRow]) -> None:
     existing = [str(path) for path in outputs if path.exists()]
     if existing and not config.force:
         raise MontageError(f"output artifact(s) already exist (use --force): {', '.join(existing)}")
-    output = config.output_path.resolve()
-    if any(output == row.clip_path.resolve() for row in rows):
+    if any(paths_collide(config.output_path, row.clip_path) for row in rows):
         raise MontageError("output path must not overwrite an input clip")
+    if config.instagram_enabled:
+        if config.instagram_width <= 0 or config.instagram_height <= 0 \
+                or config.instagram_width % 2 or config.instagram_height % 2:
+            raise MontageError("Instagram width and height must be positive even integers")
+        background = config.instagram_background
+        if background is None or not background.is_file():
+            raise MontageError(f"Instagram background is missing or not a file: {background}")
+        try:
+            with Image.open(background) as image:
+                image.verify()
+        except (OSError, UnidentifiedImageError) as error:
+            raise MontageError(f"Instagram background could not be decoded: {background} ({error})") from error
+        hubot = config.hubot_font_path or config.font_bold_path or config.font_path
+        if not hubot.is_file():
+            raise MontageError(f"Hubot Sans font is missing or not a file: {hubot}; supply a Hubot Sans TTF/OTF")
+        portrait_output = config.instagram_output_path
+        if portrait_output.exists() and not config.force:
+            raise MontageError(f"Instagram output already exists (use --force): {portrait_output}")
+        artifact_paths = (
+            ("the landscape output path", config.output_path),
+            ("the lower-third preview", config.preview_path),
+            ("the contact sheet", config.contact_sheet_path),
+            ("the loop-test video", config.loop_test_path),
+        )
+        for label, artifact in artifact_paths:
+            if paths_collide(portrait_output, artifact):
+                raise MontageError(
+                    f"Instagram output must differ from {label}: {portrait_output.resolve()}")
+        if any(paths_collide(portrait_output, row.clip_path) for row in rows):
+            raise MontageError("Instagram output must not overwrite an input clip")
     dependencies = ["ffmpeg", "ffprobe"] + (["rsvg-convert"] if config.octocat_path.suffix.lower() == ".svg" else [])
     for dependency in dependencies:
         if shutil.which(dependency) is None:
@@ -759,6 +999,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-temp", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--instagram-background", type=Path,
+                        default=os.environ.get("INSTAGRAM_BACKGROUND"))
+    parser.add_argument("--instagram-output", type=Path,
+                        default=os.environ.get("INSTAGRAM_OUTPUT"))
+    parser.add_argument("--hubot-font", type=Path, default=os.environ.get("HUBOT_FONT_PATH"))
+    parser.add_argument("--instagram-width", type=int, default=1080)
+    parser.add_argument("--instagram-height", type=int, default=1920)
     return parser
 
 
@@ -776,11 +1023,19 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         parser.error("--transition-duration and --loop-seam must be positive")
     if args.avatar_timeout <= 0:
         parser.error("--avatar-timeout must be positive")
+    hubot = args.hubot_font or _default_font("HubotSans-Bold.ttf")
+    if args.instagram_background is not None and hubot is None:
+        parser.error(
+            "Hubot Sans is required for the Instagram variant; use --hubot-font (or HUBOT_FONT_PATH)"
+        )
     return MontageConfig(
         args.input_dir, args.csv_file, args.output_file, octocat, font, args.width, args.height,
         args.fps, args.transition_duration, args.keep_temp, args.force, args.crf, args.preset,
         args.verbose, args.avatar_cache, args.avatar_timeout, args.refresh_avatars, args.offline,
         args.loop_seam, bold,
+        instagram_background=args.instagram_background, instagram_output=args.instagram_output,
+        hubot_font_path=hubot, instagram_width=args.instagram_width,
+        instagram_height=args.instagram_height,
     )
 
 
@@ -815,8 +1070,13 @@ def create_montage(config: MontageConfig) -> None:
         config.contact_sheet_path: work_dir / "montage-contact-sheet.jpg",
         config.loop_test_path: work_dir / "loop-test.mp4",
     }
+    portrait_config = replace(config, width=config.instagram_width, height=config.instagram_height,
+                              output_path=config.instagram_output_path) if config.instagram_enabled else None
+    if portrait_config is not None:
+        staging[portrait_config.output_path] = work_dir / "output-instagram.mp4"
     try:
         segments: list[Path] = []
+        portrait_segments: list[Path] = []
         contact_frames: list[Path] = []
         for index, (row, info, frames) in enumerate(zip(rows, media, frame_counts), start=1):
             overlay = work_dir / f"segment-{index:03d}-lower-third.png"
@@ -830,6 +1090,18 @@ def create_montage(config: MontageConfig) -> None:
                         f"segment render for {row.clip_path}", config.verbose)
             verify_render(segment, config, "segment validation")
             segments.append(segment)
+            if portrait_config is not None:
+                card = work_dir / f"segment-{index:03d}-instagram.png"
+                portrait_segment = work_dir / f"segment-{index:03d}-instagram.mkv"
+                portrait_avatar = load_avatar_or_fallback(
+                    row, config, max(48, round(portrait_config.width * 0.10)))
+                render_instagram_card(row, portrait_avatar, portrait_config, card)
+                run_command(
+                    build_instagram_segment_command(row, info, portrait_config, card,
+                                                    portrait_segment, timing=one_timing),
+                    f"Instagram segment render for {row.clip_path}", config.verbose)
+                verify_render(portrait_segment, portrait_config, "Instagram segment validation")
+                portrait_segments.append(portrait_segment)
             frame = work_dir / f"contact-{index:03d}.png"
             stable_frame = Decimal(max(timing.seam_frame, timing.transition_frames + round(.4 * config.fps))) / config.fps
             _extract_frame(segment, stable_frame, frame)
@@ -839,6 +1111,13 @@ def create_montage(config: MontageConfig) -> None:
                                           config, filter_path, staging[config.output_path], timing=timing),
                     "cyclic montage combine", config.verbose)
         final_info = verify_render(staging[config.output_path], config, "final validation")
+        if portrait_config is not None:
+            portrait_filter = work_dir / "cyclic-filter-instagram.txt"
+            run_command(build_combine_command(portrait_segments, [Decimal(n) / config.fps for n in frame_counts],
+                                              portrait_config, portrait_filter,
+                                              staging[portrait_config.output_path], timing=timing),
+                        "cyclic Instagram combine", config.verbose)
+            verify_render(staging[portrait_config.output_path], portrait_config, "Instagram final validation")
         shutil.copyfile(contact_frames[0], staging[config.preview_path])
         _create_contact_sheet(contact_frames, staging[config.contact_sheet_path])
         _build_loop_test(staging[config.output_path], staging[config.loop_test_path], config, final_info.duration)
@@ -869,6 +1148,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 1
     print(f"Created montage and supporting artifacts beside: {config.output_path}")
+    if config.instagram_enabled:
+        print(f"Created Instagram 9:16 montage: {config.instagram_output_path}")
     return 0
 
 

@@ -17,16 +17,21 @@ from scripts.montage import (
     MontageConfig,
     avatar_cache_path,
     build_combine_command,
+    build_instagram_segment_command,
     calculate_cycle_timing,
     calculate_transition_offsets,
     fallback_initials,
     fetch_avatar,
+    instagram_panel_height,
     normalize_username,
     parse_csv,
     parse_place_number,
+    paths_collide,
     probe_media,
+    render_instagram_card,
     render_lower_third,
     load_avatar_or_fallback,
+    validate_inputs,
 )
 
 
@@ -366,6 +371,208 @@ class AvatarAndGraphicsTests(unittest.TestCase):
             thirteenth, avatar, self.config, thirteenth_path
         )
         self.assertEqual(first_path.read_bytes(), thirteenth_path.read_bytes())
+
+
+class InstagramConfigTests(unittest.TestCase):
+    def config(self, **overrides):
+        base = dict(
+            input_dir=Path("."),
+            csv_path=Path("data.csv"),
+            output_path=Path("renders/output.mp4"),
+            octocat_path=Path("logo.svg"),
+            font_path=Path("font.ttf"),
+            width=1920,
+            height=1080,
+            fps=30,
+            transition_duration=Decimal("0.65"),
+            keep_temp=False,
+            force=False,
+        )
+        base.update(overrides)
+        return MontageConfig(**base)
+
+    def test_output_naming_and_enabled_flag(self):
+        disabled = self.config()
+        self.assertFalse(disabled.instagram_enabled)
+        enabled = self.config(instagram_background=Path("bg.png"))
+        self.assertTrue(enabled.instagram_enabled)
+        self.assertEqual(Path("renders/output-instagram.mp4"), enabled.instagram_output_path)
+        explicit = self.config(
+            instagram_background=Path("bg.png"), instagram_output=Path("reels/story.mp4")
+        )
+        self.assertEqual(Path("reels/story.mp4"), explicit.instagram_output_path)
+
+    def test_panel_height_is_even_and_16_by_9(self):
+        self.assertEqual(608, instagram_panel_height(1080))
+        self.assertEqual(0, instagram_panel_height(1080) % 2)
+
+    def test_segment_overlays_full_width_gameplay_at_top(self):
+        config = self.config(width=1080, height=1920, instagram_background=Path("bg.png"))
+        media = MediaInfo(Path("1.mp4"), Decimal("13"), True, True, 1920, 1080, None)
+        timing = calculate_cycle_timing([390], 30, Decimal("0.65"), Decimal("1.5"))
+        row = __import__("scripts.montage", fromlist=["GameRow"]).GameRow(
+            2, "1st", 1, "A", "@one", Path("1.mp4"), "one", "bottom-left"
+        )
+        command = build_instagram_segment_command(
+            row, media, config, Path("card.png"), Path("seg.mkv"), timing=timing
+        )
+        joined = " ".join(command)
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("scale=1080:608", graph)
+        self.assertIn("overlay=x=0:y=0", graph)
+        self.assertIn("[1:v]format=rgba", graph)
+        self.assertIn("trim=end_frame=390", graph)
+        self.assertIn("-map [v] -map [a]", joined)
+        self.assertIn("pcm_s16le", joined)
+        self.assertEqual("1.mp4", command[command.index("-i") + 1])
+        self.assertIn("card.png", joined)
+
+    def test_combine_graph_is_resolution_independent(self):
+        with tempfile.TemporaryDirectory(dir=".") as temp:
+            root = Path(temp)
+            segments = [root / f"{index}.mkv" for index in range(2)]
+            durations = [Decimal("3.25"), Decimal("5.5")]
+            landscape = self.config(width=1920, height=1080, output_path=root / "out.mp4")
+            portrait = self.config(width=1080, height=1920, output_path=root / "out-instagram.mp4")
+            land_filter = root / "land.txt"
+            port_filter = root / "port.txt"
+            build_combine_command(segments, durations, landscape, land_filter, root / "a.mp4")
+            build_combine_command(segments, durations, portrait, port_filter, root / "b.mp4")
+            self.assertEqual(
+                land_filter.read_text(encoding="utf-8"), port_filter.read_text(encoding="utf-8")
+            )
+
+
+class InstagramCardTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=".")
+        self.root = Path(self.temp.name)
+        font = Path(os.environ.get("MONTAGE_TEST_FONT", "/Library/Fonts/MonaSans-Regular.ttf"))
+        bold = Path(os.environ.get("MONTAGE_TEST_FONT_BOLD", "/Library/Fonts/MonaSans-Bold.ttf"))
+        if not font.is_file() or not bold.is_file():
+            self.skipTest("Mona Sans test fonts unavailable")
+        logo = self.root / "logo.png"
+        Image.new("RGBA", (32, 32), "white").save(logo)
+        self.background = self.root / "bg.png"
+        Image.new("RGB", (1200, 1600), (20, 40, 90)).save(self.background)
+        self.config = MontageConfig(
+            self.root, self.root / "data.csv", self.root / "out.mp4", logo, font,
+            1080, 1920, 30, Decimal(".65"), False, False,
+            avatar_cache=self.root / "cache", offline=True, font_bold_path=bold,
+            instagram_background=self.background, hubot_font_path=bold,
+            instagram_width=1080, instagram_height=1920,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def row(self, *, title="A Deliberately Long Rainbow Unicorn Game", place="1st"):
+        return __import__("scripts.montage", fromlist=["GameRow"]).GameRow(
+            2, place, 1, title, "@Octo-Cat", self.root / "1.mp4", "Octo-Cat", "bottom-left"
+        )
+
+    def test_card_geometry_fonts_logo_and_footer_alignment(self):
+        avatar = Image.new("RGBA", (108, 108), "blue")
+        out = self.root / "card.png"
+        layout = render_instagram_card(self.row(), avatar, self.config, out)
+        self.assertEqual((1080, 1920), (layout.width, layout.height))
+        self.assertEqual(608, layout.panel_height)
+        self.assertEqual((0, 608, 1080, 1920), layout.background_bounds)
+        # Metadata sits in the lower region, below the gameplay panel.
+        for bounds in (layout.place_bounds, layout.title_bounds, layout.avatar_bounds,
+                       layout.creator_bounds):
+            self.assertGreaterEqual(bounds[1], layout.panel_height)
+        # Wordmark bottom-left, Invertocat bottom-right at a shared margin.
+        self.assertEqual(layout.wordmark_bounds[0], 1080 - layout.octocat_bounds[2])
+        self.assertLess(layout.wordmark_bounds[2], layout.octocat_bounds[0])
+        # Matching visual height and baseline.
+        wordmark_height = layout.wordmark_bounds[3] - layout.wordmark_bounds[1]
+        octocat_height = layout.octocat_bounds[3] - layout.octocat_bounds[1]
+        self.assertLessEqual(abs(wordmark_height - octocat_height), 2)
+        self.assertLessEqual(abs(layout.wordmark_bounds[3] - layout.octocat_bounds[3]), 2)
+        self.assertEqual(
+            "A Deliberately Long Rainbow Unicorn Game", " ".join(layout.title_lines)
+        )
+        with Image.open(out) as image:
+            self.assertEqual((1080, 1920), image.size)
+            avatar_center = (
+                (layout.avatar_bounds[0] + layout.avatar_bounds[2]) // 2,
+                (layout.avatar_bounds[1] + layout.avatar_bounds[3]) // 2,
+            )
+            self.assertEqual((0, 0, 255), image.convert("RGB").getpixel(avatar_center))
+            octocat_center = (
+                (layout.octocat_bounds[0] + layout.octocat_bounds[2]) // 2,
+                (layout.octocat_bounds[1] + layout.octocat_bounds[3]) // 2,
+            )
+            self.assertEqual((255, 255, 255), image.convert("RGB").getpixel(octocat_center))
+
+    def test_card_rejects_undecodable_background(self):
+        broken = self.root / "broken.png"
+        broken.write_bytes(b"not an image")
+        config = __import__("dataclasses").replace(self.config, instagram_background=broken)
+        avatar = Image.new("RGBA", (108, 108), "blue")
+        with self.assertRaisesRegex(MontageError, "background"):
+            render_instagram_card(self.row(), avatar, config, self.root / "card.png")
+
+
+class ValidateInputsCollisionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=".")
+        self.root = Path(self.temp.name)
+        self.octocat = self.root / "logo.svg"
+        self.font = self.root / "font.ttf"
+        self.octocat.write_text("<svg/>", encoding="utf-8")
+        self.font.write_bytes(b"\x00")
+        self.background = self.root / "bg.png"
+        Image.new("RGB", (64, 64), (10, 20, 30)).save(self.background)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def config(self, instagram_output):
+        return MontageConfig(
+            self.root, self.root / "data.csv", self.root / "out.mp4", self.octocat, self.font,
+            1920, 1080, 30, Decimal(".65"), False, False,
+            font_bold_path=self.font, instagram_background=self.background,
+            hubot_font_path=self.font, instagram_output=instagram_output,
+        )
+
+    def test_instagram_output_collides_with_auxiliary_artifacts(self):
+        cases = {
+            "the lower-third preview": self.root / "lower-third-preview.png",
+            "the contact sheet": self.root / "montage-contact-sheet.jpg",
+            "the loop-test video": self.root / "loop-test.mp4",
+        }
+        for label, artifact in cases.items():
+            with self.subTest(artifact=artifact.name):
+                config = self.config(artifact)
+                with self.assertRaisesRegex(MontageError, label):
+                    validate_inputs(config, [])
+
+
+    def test_instagram_output_rejects_case_only_aliases(self):
+        cases = {
+            "the landscape output path": self.root / "OUT.mp4",
+            "the lower-third preview": self.root / "Lower-Third-Preview.png",
+            "the contact sheet": self.root / "Montage-Contact-Sheet.jpg",
+            "the loop-test video": self.root / "Loop-Test.mp4",
+        }
+        with patch("scripts.montage._case_insensitive_target", return_value=True):
+            for label, alias in cases.items():
+                with self.subTest(artifact=alias.name):
+                    config = self.config(alias)
+                    with self.assertRaisesRegex(MontageError, label):
+                        validate_inputs(config, [])
+
+    def test_case_only_alias_ignored_on_case_sensitive_target(self):
+        with patch("scripts.montage._case_insensitive_target", return_value=False):
+            self.assertFalse(paths_collide(self.root / "out.mp4", self.root / "OUT.mp4"))
+
+    def test_paths_collide_detects_case_only_and_identical(self):
+        with patch("scripts.montage._case_insensitive_target", return_value=True):
+            self.assertTrue(paths_collide(self.root / "out.mp4", self.root / "OUT.mp4"))
+        self.assertTrue(paths_collide(self.root / "out.mp4", self.root / "sub" / ".." / "out.mp4"))
+        self.assertFalse(paths_collide(self.root / "out.mp4", self.root / "other.mp4"))
 
 
 if __name__ == "__main__":
