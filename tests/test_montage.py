@@ -402,8 +402,8 @@ class InstagramConfigTests(unittest.TestCase):
         )
         self.assertEqual(Path("reels/story.mp4"), explicit.instagram_output_path)
 
-    def test_panel_height_is_even_and_16_by_9(self):
-        self.assertEqual(608, instagram_panel_height(1080))
+    def test_panel_height_is_even_and_zoomed_for_portrait(self):
+        self.assertEqual(800, instagram_panel_height(1080))
         self.assertEqual(0, instagram_panel_height(1080) % 2)
 
     def test_segment_overlays_full_width_gameplay_at_top(self):
@@ -418,7 +418,8 @@ class InstagramConfigTests(unittest.TestCase):
         )
         joined = " ".join(command)
         graph = command[command.index("-filter_complex") + 1]
-        self.assertIn("scale=1080:608", graph)
+        self.assertIn("scale=1080:800", graph)
+        self.assertIn("scale=1080:1920", graph)
         self.assertIn("overlay=x=0:y=0", graph)
         self.assertIn("[1:v]format=rgba", graph)
         self.assertIn("trim=end_frame=390", graph)
@@ -471,25 +472,27 @@ class InstagramCardTests(unittest.TestCase):
             2, place, 1, title, "@Octo-Cat", self.root / "1.mp4", "Octo-Cat", "bottom-left"
         )
 
-    def test_card_geometry_fonts_logo_and_footer_alignment(self):
+    def test_card_geometry_and_semantic_spacing(self):
         avatar = Image.new("RGBA", (108, 108), "blue")
         out = self.root / "card.png"
         layout = render_instagram_card(self.row(), avatar, self.config, out)
         self.assertEqual((1080, 1920), (layout.width, layout.height))
-        self.assertEqual(608, layout.panel_height)
-        self.assertEqual((0, 608, 1080, 1920), layout.background_bounds)
+        self.assertEqual(800, layout.panel_height)
+        self.assertEqual((0, 800, 1080, 1920), layout.background_bounds)
         # Metadata sits in the lower region, below the gameplay panel.
         for bounds in (layout.place_bounds, layout.title_bounds, layout.avatar_bounds,
                        layout.creator_bounds):
             self.assertGreaterEqual(bounds[1], layout.panel_height)
-        # Wordmark bottom-left, Invertocat bottom-right at a shared margin.
-        self.assertEqual(layout.wordmark_bounds[0], 1080 - layout.octocat_bounds[2])
-        self.assertLess(layout.wordmark_bounds[2], layout.octocat_bounds[0])
-        # Matching visual height and baseline.
-        wordmark_height = layout.wordmark_bounds[3] - layout.wordmark_bounds[1]
-        octocat_height = layout.octocat_bounds[3] - layout.octocat_bounds[1]
-        self.assertLessEqual(abs(wordmark_height - octocat_height), 2)
-        self.assertLessEqual(abs(layout.wordmark_bounds[3] - layout.octocat_bounds[3]), 2)
+        self.assertLess(layout.countdown_bounds[3], layout.panel_height)
+        self.assertGreaterEqual(layout.title_size, 72)
+        self.assertGreaterEqual(
+            layout.place_label_bounds[0] - layout.trophy_bounds[2], 10
+        )
+        self.assertLessEqual(layout.place_label_bounds[2], layout.place_bounds[2])
+        # With no footer wordmark reservation, the Invertocat balances the footer.
+        self.assertLessEqual(
+            abs((layout.octocat_bounds[0] + layout.octocat_bounds[2]) - layout.width), 1
+        )
         self.assertEqual(
             "A Deliberately Long Rainbow Unicorn Game", " ".join(layout.title_lines)
         )
@@ -505,6 +508,27 @@ class InstagramCardTests(unittest.TestCase):
                 (layout.octocat_bounds[1] + layout.octocat_bounds[3]) // 2,
             )
             self.assertEqual((255, 255, 255), image.convert("RGB").getpixel(octocat_center))
+            alpha = image.getchannel("A")
+            # The lower treatment starts exactly at the gameplay boundary.
+            upper_edge = alpha.crop(
+                (0, layout.panel_height - 1, layout.width, layout.panel_height)
+            )
+            lower_edge = alpha.crop(
+                (0, layout.panel_height, layout.width, layout.panel_height + 1)
+            )
+            self.assertEqual(0, upper_edge.getextrema()[1])
+            self.assertGreater(lower_edge.getextrema()[0], 0)
+
+    def test_countdown_pill_has_antialiased_edges(self):
+        out = self.root / "card.png"
+        layout = render_instagram_card(
+            self.row(), Image.new("RGBA", (108, 108), "blue"), self.config, out
+        )
+        with Image.open(out) as image:
+            alpha = image.getchannel("A").crop(layout.countdown_bounds)
+            edge_alphas = {value for value, count in enumerate(alpha.histogram()) if count}
+        self.assertGreater(len(edge_alphas), 12)
+        self.assertTrue(any(0 < value < 48 for value in edge_alphas))
 
     def test_card_rejects_undecodable_background(self):
         broken = self.root / "broken.png"

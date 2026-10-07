@@ -24,7 +24,15 @@ from pathlib import Path
 from typing import Literal, Sequence
 
 try:
-    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, UnidentifiedImageError
+    from PIL import (
+        Image,
+        ImageChops,
+        ImageDraw,
+        ImageFilter,
+        ImageFont,
+        ImageOps,
+        UnidentifiedImageError,
+    )
 except ImportError as error:  # pragma: no cover - exercised by CLI installations
     raise SystemExit("Pillow is required; run: python3 -m pip install -r requirements.txt") from error
 
@@ -150,7 +158,9 @@ class InstagramLayout:
     title_bounds: tuple[int, int, int, int]
     avatar_bounds: tuple[int, int, int, int]
     creator_bounds: tuple[int, int, int, int]
-    wordmark_bounds: tuple[int, int, int, int]
+    countdown_bounds: tuple[int, int, int, int]
+    trophy_bounds: tuple[int, int, int, int]
+    place_label_bounds: tuple[int, int, int, int]
     octocat_bounds: tuple[int, int, int, int]
     title_lines: tuple[str, ...]
     title_size: int
@@ -632,7 +642,7 @@ def build_segment_command(
 
 
 def instagram_panel_height(width: int) -> int:
-    height = int((Decimal(width) * 9 / 16).to_integral_value(rounding=ROUND_HALF_UP))
+    height = int((Decimal(width) * 20 / 27).to_integral_value(rounding=ROUND_HALF_UP))
     return height + (height % 2)
 
 
@@ -642,10 +652,7 @@ def render_instagram_card(
     width, height = config.width, config.height
     panel_h = instagram_panel_height(width)
     margin = max(24, round(width * 0.06))
-    canvas = Image.new("RGBA", (width, height), (13, 17, 23, 255))
-    # Gameplay occupies the top panel at render time; keep it dark in the card.
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle((0, 0, width - 1, panel_h - 1), fill=(0, 0, 0, 255))
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     background_bounds = (0, panel_h, width, height)
     try:
         with Image.open(config.instagram_background) as source:
@@ -663,9 +670,18 @@ def render_instagram_card(
     crop_left = (resized.width - region_w) // 2
     crop_top = (resized.height - region_h) // 2
     backdrop = resized.crop((crop_left, crop_top, crop_left + region_w, crop_top + region_h))
+    backdrop = ImageOps.colorize(
+        ImageOps.grayscale(backdrop), black=(8, 12, 20), white=(74, 88, 112)
+    ).convert("RGBA")
+    backdrop.putalpha(24)
     canvas.alpha_composite(backdrop, (0, panel_h))
-    # Darken the lower region slightly for text legibility over any artwork.
-    scrim = Image.new("RGBA", (region_w, region_h), (13, 17, 23, 120))
+
+    scrim = Image.new("RGBA", (width, height - panel_h), (0, 0, 0, 0))
+    scrim_draw = ImageDraw.Draw(scrim)
+    for y in range(scrim.height):
+        progress = y / max(1, scrim.height - 1)
+        alpha = round(54 + 64 * progress)
+        scrim_draw.line((0, y, width, y), fill=(7, 11, 19, alpha))
     canvas.alpha_composite(scrim, (0, panel_h))
     draw = ImageDraw.Draw(canvas)
 
@@ -674,39 +690,119 @@ def render_instagram_card(
     content_left = margin
     content_width = width - 2 * margin
 
-    # Footer: wordmark bottom-left (Hubot Sans), white Invertocat bottom-right.
+    # A centered Invertocat gives the footer a balanced, quiet endpoint.
     footer_bottom = height - margin
-    hubot_path = config.hubot_font_path or bold_path
-    wordmark_text = "JS13KGAMES"
-    foot_size = max(20, round(width * 0.044))
-    hubot_font = ImageFont.truetype(str(hubot_path), foot_size)
-    wm_box = draw.textbbox((0, 0), wordmark_text, font=hubot_font)
-    cap_height = wm_box[3] - wm_box[1]
-    wm_width = wm_box[2] - wm_box[0]
-    wm_draw_x = content_left - wm_box[0]
-    wm_draw_y = footer_bottom - wm_box[3]
-    draw.text((wm_draw_x, wm_draw_y), wordmark_text, font=hubot_font, fill=(255, 255, 255, 255))
-    wordmark_bounds = (content_left, footer_bottom - cap_height, content_left + wm_width, footer_bottom)
-    logo_size = cap_height
-    octo_x = width - margin - logo_size
+    logo_size = max(42, round(width * 0.044))
+    octo_x = (width - logo_size) // 2
     octo_y = footer_bottom - logo_size
     canvas.alpha_composite(_load_octocat(config, logo_size), (octo_x, octo_y))
     octocat_bounds = (octo_x, octo_y, octo_x + logo_size, octo_y + logo_size)
-    footer_top = min(wordmark_bounds[1], octocat_bounds[1])
+    footer_top = octocat_bounds[1]
 
-    # Metadata (Mona Sans): place, title, avatar, creator.
-    content_top = panel_h + margin
-    place_size = max(16, round(width * 0.040))
+    countdown_size = max(18, round(width * 0.030))
+    countdown_font = ImageFont.truetype(str(bold_path), countdown_size)
+    countdown_text = f"{row.place_number:02d} / 13"
+    countdown_box = draw.textbbox((0, 0), countdown_text, font=countdown_font)
+    countdown_w = countdown_box[2] - countdown_box[0]
+    countdown_h = countdown_box[3] - countdown_box[1]
+    countdown_pad_x = round(width * 0.022)
+    countdown_pad_y = round(width * 0.013)
+    countdown_right = width - margin
+    countdown_top = margin
+    countdown_bounds = (
+        countdown_right - countdown_w - 2 * countdown_pad_x,
+        countdown_top,
+        countdown_right,
+        countdown_top + countdown_h + 2 * countdown_pad_y,
+    )
+    pill_scale = 4
+    pill_w = countdown_bounds[2] - countdown_bounds[0]
+    pill_h = countdown_bounds[3] - countdown_bounds[1]
+    pill = Image.new("RGBA", (pill_w * pill_scale, pill_h * pill_scale), (0, 0, 0, 0))
+    pill_draw = ImageDraw.Draw(pill)
+    pill_draw.rounded_rectangle(
+        (0, 0, pill.width - 1, pill.height - 1),
+        radius=pill_h * pill_scale // 2,
+        fill=(7, 11, 19, 185),
+        outline=(255, 255, 255, 48),
+        width=pill_scale,
+    )
+    pill_font = ImageFont.truetype(str(bold_path), countdown_size * pill_scale)
+    pill_text_box = pill_draw.textbbox((0, 0), countdown_text, font=pill_font)
+    pill_draw.text(
+        (
+            countdown_pad_x * pill_scale - pill_text_box[0],
+            countdown_pad_y * pill_scale - pill_text_box[1],
+        ),
+        countdown_text,
+        font=pill_font,
+        fill=(255, 255, 255, 235),
+    )
+    pill = pill.resize((pill_w, pill_h), Image.Resampling.LANCZOS)
+    canvas.alpha_composite(pill, (countdown_bounds[0], countdown_bounds[1]))
+
+    # Compact award badge, large title, and tightly grouped creator identity.
+    content_top = panel_h + max(38, round(height * 0.026))
+    place_size = max(18, round(width * 0.030))
     place_font = ImageFont.truetype(str(bold_path), place_size)
-    place_text = f"{row.place} place"
-    place_box = draw.textbbox((content_left, content_top), place_text, font=place_font)
-    draw.text((content_left, content_top), place_text, font=place_font, fill=(126, 231, 135, 255))
-    place_bounds = (content_left, content_top, place_box[2], place_box[3])
+    place_text = f"{row.place.upper()} PLACE"
+    place_box = draw.textbbox((0, 0), place_text, font=place_font)
+    place_text_w = place_box[2] - place_box[0]
+    place_text_h = place_box[3] - place_box[1]
+    badge_h = max(48, round(width * 0.052))
+    badge_pad = round(width * 0.018)
+    trophy_w = round(badge_h * 0.62)
+    trophy_gap = max(10, round(width * 0.011))
+    place_bounds = (
+        content_left,
+        content_top,
+        content_left + trophy_w + badge_pad + place_text_w + 2 * badge_pad,
+        content_top + badge_h,
+    )
+    draw.rounded_rectangle(
+        place_bounds,
+        radius=badge_h // 2,
+        fill=(17, 24, 36, 225),
+        outline=(240, 184, 65, 190),
+        width=max(1, round(width * 0.002)),
+    )
+    trophy_x = content_left + badge_pad
+    trophy_y = content_top + badge_h // 2
+    trophy_bounds = (trophy_x, content_top, trophy_x + trophy_w, content_top + badge_h)
+    gold = (250, 204, 82, 255)
+    cup_w, cup_h = round(trophy_w * 0.54), round(badge_h * 0.42)
+    cup_left = trophy_x + (trophy_w - cup_w) // 2
+    cup_top = trophy_y - cup_h // 2 - 3
+    draw.rounded_rectangle(
+        (cup_left, cup_top, cup_left + cup_w, cup_top + cup_h),
+        radius=4,
+        fill=gold,
+    )
+    draw.arc(
+        (cup_left - cup_w // 2, cup_top, cup_left + cup_w // 2, cup_top + cup_h),
+        80, 280, fill=gold, width=3,
+    )
+    draw.arc(
+        (cup_left + cup_w // 2, cup_top, cup_left + cup_w + cup_w // 2, cup_top + cup_h),
+        -100, 100, fill=gold, width=3,
+    )
+    stem_x = cup_left + cup_w // 2
+    draw.line((stem_x, cup_top + cup_h, stem_x, cup_top + cup_h + 7), fill=gold, width=4)
+    draw.line((stem_x - 8, cup_top + cup_h + 7, stem_x + 8, cup_top + cup_h + 7), fill=gold, width=4)
+    place_text_x = content_left + trophy_w + badge_pad + trophy_gap
+    place_text_y = content_top + (badge_h - place_text_h) // 2 - place_box[1]
+    draw.text((place_text_x, place_text_y), place_text, font=place_font, fill=(255, 255, 255, 255))
+    place_label_bounds = (
+        place_text_x,
+        content_top + (badge_h - place_text_h) // 2,
+        place_text_x + place_text_w,
+        content_top + (badge_h + place_text_h) // 2,
+    )
 
-    title_top = place_bounds[3] + max(10, round(height * 0.010))
+    title_top = place_bounds[3] + max(18, round(height * 0.012))
     title_font, lines = _fit_title(
-        draw, row.title, bold_path, content_width, round(height * 0.26),
-        max(36, round(width * 0.085)), max(22, round(width * 0.050)),
+        draw, row.title, bold_path, content_width, round(height * 0.20),
+        max(72, round(width * 0.074)), max(48, round(width * 0.050)),
     )
     title_line_h = draw.textbbox((0, 0), "Ag", font=title_font)[3]
     title_y = title_top
@@ -716,14 +812,14 @@ def render_instagram_card(
     title_bottom = title_y + len(lines) * round(title_line_h * 1.08)
     title_bounds = (content_left, title_top, content_left + content_width, title_bottom)
 
-    avatar_size = max(48, round(width * 0.10))
-    avatar_top = title_bottom + max(18, round(height * 0.020))
+    avatar_size = max(64, round(width * 0.082))
+    avatar_top = title_bottom + max(12, round(height * 0.009))
     avatar_top = min(avatar_top, footer_top - avatar_size - margin)
     av_x, av_y = content_left, avatar_top
     canvas.alpha_composite(avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS), (av_x, av_y))
     avatar_bounds = (av_x, av_y, av_x + avatar_size, av_y + avatar_size)
 
-    creator_size = max(16, round(width * 0.036))
+    creator_size = max(18, round(width * 0.032))
     creator_font = ImageFont.truetype(str(regular_path), creator_size)
     creator_x = av_x + avatar_size + max(16, round(width * 0.022))
     creator_box = draw.textbbox((0, 0), row.username, font=creator_font)
@@ -734,10 +830,12 @@ def render_instagram_card(
                       creator_x + (creator_box[2] - creator_box[0]), av_y + (avatar_size + creator_h) // 2)
 
     output_png.parent.mkdir(parents=True, exist_ok=True)
-    canvas.convert("RGB").save(output_png)
+    canvas.save(output_png)
     return InstagramLayout(
         width, height, panel_h, background_bounds, place_bounds, title_bounds,
-        avatar_bounds, creator_bounds, wordmark_bounds, octocat_bounds, lines, title_font.size,
+        avatar_bounds, creator_bounds, countdown_bounds, trophy_bounds, place_label_bounds,
+        octocat_bounds,
+        lines, title_font.size,
     )
 
 
@@ -752,12 +850,13 @@ def build_instagram_segment_command(
     panel_h = instagram_panel_height(config.width)
     video_filter = (
         f"[0:v]split=2[bg0][fg0];"
-        f"[bg0]scale={config.width}:{panel_h}:force_original_aspect_ratio=increase,"
-        f"crop={config.width}:{panel_h},gblur=sigma=18,eq=brightness=-0.18[bg];"
-        f"[fg0]scale={config.width}:{panel_h}:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[panel];"
+        f"[bg0]scale={config.width}:{config.height},gblur=sigma=42,"
+        f"eq=brightness=-0.08:saturation=1.0[bg];"
+        f"[fg0]scale={config.width}:{panel_h}:force_original_aspect_ratio=increase,"
+        f"crop={config.width}:{panel_h}[panel];"
+        f"[bg][panel]overlay=x=0:y=0[scene];"
         f"[1:v]format=rgba,trim=duration={decimal_text(duration)}[card];"
-        f"[card][panel]overlay=x=0:y=0:format=auto,"
+        f"[scene][card]overlay=x=0:y=0:format=auto,"
         f"fps={config.fps},trim=end_frame={frame_count},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v]"
     )
     audio_index = 0 if media.has_audio else 2
@@ -885,9 +984,6 @@ def validate_inputs(config: MontageConfig, rows: Sequence[GameRow]) -> None:
                 image.verify()
         except (OSError, UnidentifiedImageError) as error:
             raise MontageError(f"Instagram background could not be decoded: {background} ({error})") from error
-        hubot = config.hubot_font_path or config.font_bold_path or config.font_path
-        if not hubot.is_file():
-            raise MontageError(f"Hubot Sans font is missing or not a file: {hubot}; supply a Hubot Sans TTF/OTF")
         portrait_output = config.instagram_output_path
         if portrait_output.exists() and not config.force:
             raise MontageError(f"Instagram output already exists (use --force): {portrait_output}")
@@ -1024,10 +1120,6 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     if args.avatar_timeout <= 0:
         parser.error("--avatar-timeout must be positive")
     hubot = args.hubot_font or _default_font("HubotSans-Bold.ttf")
-    if args.instagram_background is not None and hubot is None:
-        parser.error(
-            "Hubot Sans is required for the Instagram variant; use --hubot-font (or HUBOT_FONT_PATH)"
-        )
     return MontageConfig(
         args.input_dir, args.csv_file, args.output_file, octocat, font, args.width, args.height,
         args.fps, args.transition_duration, args.keep_temp, args.force, args.crf, args.preset,

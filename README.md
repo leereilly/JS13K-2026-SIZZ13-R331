@@ -43,12 +43,13 @@ Useful options:
 ### Instagram 9:16 variant
 
 Pass `--instagram-background <image>` to additionally render a portrait
-1080×1920 montage from the same clips in the same CSV order. Gameplay is placed
-full width across the top (a 1080×608 16:9 panel with the same blurred, no-crop
-fill), and the supplied image fills the lower region behind the game title,
-place, creator, and avatar (Mona Sans). The footer shows uppercase
-`JS13KGAMES` in Hubot Sans at bottom-left and the white Invertocat bottom-right
-at the same visual height.
+1080×1920 montage from the same clips in the same CSV order. Gameplay is zoomed
+and center-cropped into a full-width 1080×800 hero panel. A darkened, heavily
+blurred continuation of the live gameplay fills the lower region, with the
+supplied image used only as a subtle event texture. Each card adds a compact
+trophy/place badge, a large game title, tightly grouped creator identity, and
+an upper-right countdown (`01 / 13`). A centered white Invertocat anchors the
+footer without competing with the game details.
 
 ```bash
 ./make-montage.sh videos/ data.csv output.mp4 \
@@ -56,16 +57,16 @@ at the same visual height.
   --font /Library/Fonts/MonaSans-Regular.ttf \
   --font-bold /Library/Fonts/MonaSans-Bold.ttf \
   --instagram-background assets/instagram-backdrop.png \
-  --hubot-font /Library/Fonts/HubotSans-Bold.ttf
+  --hubot-font assets/fonts/HubotSans-Bold.ttf \
+  --force
 ```
 
 The portrait file defaults to `<output>-instagram.mp4` beside the landscape
-output; override it with `--instagram-output`. `--hubot-font`
-(or `HUBOT_FONT_PATH`) is required when the variant is enabled; the background
-and `--instagram-output` also honour `INSTAGRAM_BACKGROUND` and
-`INSTAGRAM_OUTPUT`. The landscape output and all its artifacts are unchanged,
-and both files are published atomically. Omit `--instagram-background` to keep
-the original landscape-only behavior.
+output; override it with `--instagram-output`. The background and
+`--instagram-output` also honour `INSTAGRAM_BACKGROUND` and `INSTAGRAM_OUTPUT`.
+The landscape output and all its artifacts are unchanged, and both files are
+published atomically. Omit `--instagram-background` to keep the original
+landscape-only behavior.
 
 `--force` applies to all four deliverables. Publication is atomic: existing
 deliverables are left in place if rendering fails. `--keep-temp` preserves the
